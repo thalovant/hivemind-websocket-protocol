@@ -178,6 +178,52 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     trusted_proxy_networks: tuple[Any, ...] = ()
 
     @staticmethod
+    def _serialized_session(session: Any) -> dict[str, Any]:
+        if isinstance(session, dict):
+            return dict(session)
+        if hasattr(session, "serialize"):
+            try:
+                serialized = session.serialize()
+            except Exception:
+                LOG.exception("Failed to serialize HiveMind client session")
+                return {}
+            return dict(serialized) if isinstance(serialized, dict) else {}
+        return {}
+
+    def _remember_hello_session(self, message: Any) -> None:
+        payload = message.payload if hasattr(message, "payload") else None
+        if not isinstance(payload, dict):
+            return
+        raw_session = payload.get("session")
+        if not isinstance(raw_session, dict):
+            return
+        try:
+            self.client.sess = Session.deserialize(raw_session)
+        except Exception:
+            LOG.exception("Failed to cache HiveMind hello session")
+
+    def _hydrate_bus_session(self, message: Any) -> Any:
+        if message.msg_type != HiveMessageType.BUS:
+            return message
+
+        payload = message.payload
+        context = dict(payload.context or {})
+        incoming_session = context.get("session")
+        if not isinstance(incoming_session, dict):
+            return message
+
+        cached_session = self._serialized_session(getattr(self.client, "sess", None))
+        if not cached_session:
+            return message
+
+        hydrated_session = dict(cached_session)
+        hydrated_session.update(incoming_session)
+        context["session"] = hydrated_session
+        payload.context = context
+        message.payload = payload
+        return message
+
+    @staticmethod
     def _normalize_ip(value: str | None) -> Optional[str]:
         if not isinstance(value, str):
             return None
@@ -305,6 +351,9 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             message (str): The incoming message.
         """
         message = self.client.decode(message)
+        if message.msg_type == HiveMessageType.HELLO:
+            self._remember_hello_session(message)
+        message = self._hydrate_bus_session(message)
         source_ip = getattr(self.client, "source_ip", None)
         source_label = f" from {source_ip}" if source_ip else ""
         if (
