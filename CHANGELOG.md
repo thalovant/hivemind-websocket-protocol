@@ -1,68 +1,38 @@
 # Changelog
 
-## [0.2.1a1](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.2.1a1) (2026-06-06)
+## [0.2.1a2](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a2) (2026-06-08)
 
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.2.0a3...0.2.1a1)
-
-**Merged pull requests:**
-
-- fix: drop removed message\_blacklist read \(+ sha256 cert\) [\#28](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/28) ([JarbasAl](https://github.com/JarbasAl))
-
-## [0.2.0a3](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.2.0a3) (2026-06-05)
-
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.2.0a2...0.2.0a3)
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.4a1...0.2.1a2)
 
 **Merged pull requests:**
 
-- docs: zero-to-hero README and /docs coverage [\#25](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/25) ([JarbasAl](https://github.com/JarbasAl))
+- Add websocket heartbeat settings [\#3](https://github.com/thalovant/hivemind-websocket-protocol/pull/3) ([goldyfruit](https://github.com/goldyfruit))
+- Trust client IP from known proxies [\#2](https://github.com/thalovant/hivemind-websocket-protocol/pull/2) ([goldyfruit](https://github.com/goldyfruit))
+- Handle bad websocket auth [\#1](https://github.com/thalovant/hivemind-websocket-protocol/pull/1) ([goldyfruit](https://github.com/goldyfruit))
 
-## [0.2.0a2](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.2.0a2) (2026-05-18)
+## [0.0.4a1](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.0.4a1) (2025-12-18)
 
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.2.0a1...0.2.0a2)
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.3...0.0.4a1)
 
-**Merged pull requests:**
+## [0.0.3](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.0.3) (2025-04-26)
 
-- docs: add /docs/ and refresh README [\#18](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/18) ([JarbasAl](https://github.com/JarbasAl))
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.3a1...0.0.3)
 
-## [0.2.0a1](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.2.0a1) (2026-05-18)
+## [0.0.3a1](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.0.3a1) (2025-04-26)
 
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.1.0a1...0.2.0a1)
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.2...0.0.3a1)
 
-**Merged pull requests:**
+## [0.0.2](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.0.2) (2024-12-29)
 
-- feat: trusted client IP from known proxies \(supersedes \#14\) [\#15](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/15) ([JarbasAl](https://github.com/JarbasAl))
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.2a1...0.0.2)
 
-## [0.1.0a1](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.1.0a1) (2026-05-18)
+## [0.0.2a1](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.0.2a1) (2024-12-29)
 
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.0.4a3...0.1.0a1)
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.1...0.0.2a1)
 
-**Merged pull requests:**
+## [0.0.1](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.0.1) (2024-12-28)
 
-- feat\(tests\): hivescope e2e suite \(supersedes \#11\) [\#21](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/21) ([JarbasAl](https://github.com/JarbasAl))
-
-## [0.0.4a3](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.0.4a3) (2026-05-18)
-
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.0.4a2...0.0.4a3)
-
-**Merged pull requests:**
-
-- ci: add standard OpenVoiceOS GitHub Actions workflows [\#19](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/19) ([JarbasAl](https://github.com/JarbasAl))
-
-## [0.0.4a2](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.0.4a2) (2026-05-18)
-
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.0.4a1...0.0.4a2)
-
-**Merged pull requests:**
-
-- Handle bad websocket auth [\#12](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/12) ([goldyfruit](https://github.com/goldyfruit))
-
-## [0.0.4a1](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/tree/0.0.4a1) (2025-12-18)
-
-[Full Changelog](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/compare/0.0.3...0.0.4a1)
-
-**Merged pull requests:**
-
-- chore: Configure Renovate [\#5](https://github.com/JarbasHiveMind/hivemind-websocket-protocol/pull/5) ([renovate[bot]](https://github.com/apps/renovate))
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/3c7f5766be3b0e1efdba71ef6b966a40b21d5595...0.0.1)
 
 
 
