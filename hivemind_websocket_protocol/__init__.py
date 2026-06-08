@@ -67,16 +67,6 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                 LOG.warning(f"Ignoring invalid trusted proxy CIDR: {proxy_cidr}")
         return tuple(networks)
 
-    @staticmethod
-    def _config_float(value: Any, default: float) -> float:
-        if value is None or value == "":
-            return default
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            LOG.warning(f"Ignoring invalid websocket heartbeat value: {value}")
-            return default
-
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
@@ -107,32 +97,9 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         host = self.config.get("host") or self.identity.default_master or "0.0.0.0"
         host = host.split("://")[-1]
         port = int(self.config.get("port") or self.identity.default_port or 5678)
-        ping_interval = self._config_float(
-            self.config.get(
-                "websocket_ping_interval",
-                os.getenv("HIVEMIND_WEBSOCKET_PING_INTERVAL")
-            ),
-            30.0
-        )
-        ping_timeout = self._config_float(
-            self.config.get(
-                "websocket_ping_timeout",
-                os.getenv("HIVEMIND_WEBSOCKET_PING_TIMEOUT")
-            ),
-            90.0
-        )
 
         routes: list = [("/", HiveMindTornadoWebSocket)]
-        application = web.Application(
-            routes,
-            websocket_ping_interval=ping_interval,
-            websocket_ping_timeout=ping_timeout,
-        )
-        if ping_interval > 0:
-            LOG.info(
-                "websocket heartbeat enabled: "
-                f"ping_interval={ping_interval}s ping_timeout={ping_timeout}s"
-            )
+        application = web.Application(routes)
         if ssl:
             cert_file = f"{cert_dir}/{cert_name}.crt"
             key_file = f"{cert_dir}/{cert_name}.key"

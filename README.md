@@ -20,15 +20,3 @@ without inspecting any forwarding headers.
 These headers are only consulted when the direct connection comes from a trusted
 proxy CIDR. For forwarded chains, the listener walks from right to left and uses
 the first address that is not in the trusted proxy ranges.
-
-## Websocket heartbeat
-
-The listener sends websocket ping frames by default so long-lived clients stay
-alive behind proxies such as Cloudflare:
-
-```shell
-HIVEMIND_WEBSOCKET_PING_INTERVAL=30
-HIVEMIND_WEBSOCKET_PING_TIMEOUT=90
-```
-
-Set `HIVEMIND_WEBSOCKET_PING_INTERVAL=0` to disable server-side pings.
