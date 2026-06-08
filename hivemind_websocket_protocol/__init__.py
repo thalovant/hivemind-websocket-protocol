@@ -1,7 +1,6 @@
 import asyncio
 import binascii
 import dataclasses
-import ipaddress
 import os
 import os.path
 import random
@@ -9,7 +8,6 @@ from os import makedirs
 from os.path import exists, join
 from socket import gethostname
 from typing import Dict, Any, Optional, Tuple
-from urllib.parse import unquote
 
 import pybase64
 from OpenSSL import crypto
@@ -32,6 +30,22 @@ from hivemind_core.protocol import (
 from hivemind_plugin_manager.protocols import ClientCallbacks
 from hivemind_plugin_manager.database import Client
 
+from hivemind_websocket_protocol._client_ip import (
+    parse_networks,
+    resolve_client_ip,
+)
+
+
+DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
+
+
+def _split_csv(value: Any) -> Tuple[str, ...]:
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return tuple(v.strip() for v in value.split(",") if v.strip())
+    return tuple(str(v).strip() for v in value if str(v).strip())
+
 
 @dataclasses.dataclass
 class HiveMindWebsocketProtocol(NetworkProtocol):
@@ -45,33 +59,12 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
     hm_protocol: Optional[HiveMindListenerProtocol] = None
     callbacks: ClientCallbacks = dataclasses.field(default_factory=ClientCallbacks)
 
-    @staticmethod
-    def _config_list(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        if isinstance(value, (list, tuple, set)):
-            items = [str(item).strip() for item in value]
-            return [item for item in items if item]
-        item = str(value).strip()
-        return [item] if item else []
-
-    @classmethod
-    def _trusted_proxy_networks(cls, value: Any) -> tuple[Any, ...]:
-        networks = []
-        for proxy_cidr in cls._config_list(value):
-            try:
-                networks.append(ipaddress.ip_network(proxy_cidr, strict=False))
-            except ValueError:
-                LOG.warning(f"Ignoring invalid trusted proxy CIDR: {proxy_cidr}")
-        return tuple(networks)
-
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
         HiveMindTornadoWebSocket.loop = ioloop.IOLoop.current()
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
+
         if "trusted_proxy_cidrs" in self.config:
             proxy_cidrs = self.config["trusted_proxy_cidrs"]
         else:
@@ -82,14 +75,10 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         else:
             client_ip_headers = (
                 os.getenv("HIVEMIND_TRUSTED_CLIENT_IP_HEADERS")
-                or "x-hivemind-client-ip"
+                or DEFAULT_TRUSTED_HEADERS
             )
-        HiveMindTornadoWebSocket.trusted_proxy_networks = self._trusted_proxy_networks(
-            proxy_cidrs
-        )
-        HiveMindTornadoWebSocket.trusted_client_ip_headers = tuple(
-            header.lower() for header in self._config_list(client_ip_headers)
-        )
+        trusted_networks = parse_networks(_split_csv(proxy_cidrs))
+        trusted_headers = tuple(h.lower() for h in _split_csv(client_ip_headers))
 
         ssl = self.config.get("ssl", False)
         cert_dir: str = self.config.get("cert_dir") or f"{xdg_data_home()}/hivemind"
@@ -99,7 +88,11 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         port = int(self.config.get("port") or self.identity.default_port or 5678)
 
         routes: list = [("/", HiveMindTornadoWebSocket)]
-        application = web.Application(routes)
+        application = web.Application(
+            routes,
+            trusted_networks=trusted_networks,
+            trusted_headers=trusted_headers,
+        )
         if ssl:
             cert_file = f"{cert_dir}/{cert_name}.crt"
             key_file = f"{cert_dir}/{cert_name}.key"
@@ -157,8 +150,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)
             cert.set_issuer(cert.get_subject())
             cert.set_pubkey(k)
-            # TODO: Don't use SHA1
-            cert.sign(k, "sha1")
+            cert.sign(k, "sha256")
 
             open(cert_path, "wb").write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
             open(key_path, "wb").write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
@@ -174,8 +166,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         hm_protocol (Optional[HiveMindListenerProtocol]): The protocol instance for handling HiveMind messages.
     """
     hm_protocol = None
-    trusted_client_ip_headers: tuple[str, ...] = ("x-hivemind-client-ip",)
-    trusted_proxy_networks: tuple[Any, ...] = ()
+    source_ip: Optional[str] = None
 
     @staticmethod
     def _serialized_session(session: Any) -> dict[str, Any]:
@@ -223,88 +214,13 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         message.payload = payload
         return message
 
-    @staticmethod
-    def _normalize_ip(value: str | None) -> Optional[str]:
-        if not isinstance(value, str):
-            return None
-        candidate = value.strip().strip('"')
-        if not candidate:
-            return None
-        if candidate.startswith("[") and "]" in candidate:
-            candidate = candidate[1:candidate.index("]")]
-        elif candidate.count(":") == 1 and "." in candidate:
-            candidate = candidate.rsplit(":", 1)[0]
-        candidate = candidate.split("%", 1)[0]
-        try:
-            return str(ipaddress.ip_address(candidate))
-        except ValueError:
-            return None
-
-    def _header_ip_candidates(self) -> list[list[str]]:
-        candidate_groups: list[list[str]] = []
-        seen: set[str] = set()
-        for header in self.trusted_client_ip_headers:
-            header_value = self.request.headers.get(header)
-            if not isinstance(header_value, str):
-                continue
-            if header == "x-forwarded-for":
-                values = header_value.split(",")
-            elif header == "forwarded":
-                values = []
-                for entry in header_value.split(","):
-                    for token in entry.split(";"):
-                        key, separator, value = token.strip().partition("=")
-                        if separator and key.lower() == "for":
-                            values.append(value)
-            else:
-                values = [header_value]
-
-            candidates: list[str] = []
-            for value in values:
-                ip_value = self._normalize_ip(value)
-                if ip_value and ip_value not in seen:
-                    candidates.append(ip_value)
-                    seen.add(ip_value)
-
-            if candidates:
-                candidate_groups.append(candidates)
-
-        return candidate_groups
-
-    @staticmethod
-    def _is_global_ip(value: str | None) -> bool:
-        if not value:
-            return False
-        try:
-            return ipaddress.ip_address(value).is_global
-        except ValueError:
-            return False
-
-    def _connection_ip(self) -> Optional[str]:
-        remote_ip = self._normalize_ip(getattr(self.request, "remote_ip", None))
-        if self._is_trusted_proxy(remote_ip):
-            for candidates in self._header_ip_candidates():
-                return self._client_ip_from_candidates(candidates)
-        if self._is_global_ip(remote_ip):
-            return remote_ip
-        return remote_ip
-
-    def _client_ip_from_candidates(self, candidates: list[str]) -> str:
-        for candidate in reversed(candidates):
-            if not self._is_trusted_proxy(candidate):
-                return candidate
-        return candidates[0]
-
-    @classmethod
-    def _is_trusted_proxy(cls, remote_ip: str | None) -> bool:
-        if not remote_ip or not cls.trusted_proxy_networks:
-            return False
-        try:
-            ip_address = ipaddress.ip_address(remote_ip)
-        except ValueError:
-            return False
-        return any(ip_address in network for network in cls.trusted_proxy_networks)
-
+    def _client_ip(self) -> Optional[str]:
+        return resolve_client_ip(
+            getattr(self.request, "remote_ip", None),
+            self.request.headers,
+            self.settings.get("trusted_networks", ()),
+            self.settings.get("trusted_headers", ()),
+        )
 
     @staticmethod
     def decode_auth(auth: str) -> Tuple[str, str]:
@@ -320,64 +236,50 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         if not auth:
             raise ValueError("missing authorization")
         try:
-            userpass_encoded = bytes(auth.strip(), encoding="utf-8")
-            userpass_decoded = pybase64.b64decode(userpass_encoded, validate=True).decode("utf-8")
+            decoded = pybase64.b64decode(auth.strip(), validate=True).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError) as e:
             raise ValueError("invalid authorization encoding") from e
-        if ":" not in userpass_decoded:
+        if ":" not in decoded:
             raise ValueError("invalid authorization payload")
-        name, key = userpass_decoded.split(":", 1)
+        name, key = decoded.split(":", 1)
         if not name or not key:
             raise ValueError("invalid authorization payload")
         return name, key
 
-    @staticmethod
-    def _query_argument(query: str | bytes | None, name: str) -> Optional[str]:
-        if isinstance(query, bytes):
-            query = query.decode("utf-8", errors="ignore")
-        if not isinstance(query, str) or not query:
-            return None
-        for part in query.split("&"):
-            key, separator, value = part.partition("=")
-            if unquote(key) == name:
-                return unquote(value) if separator else ""
-        return None
-
     def on_message(self, message: str) -> None:
-        """
-        Handle incoming messages from the WebSocket.
-
-        Args:
-            message (str): The incoming message.
-        """
         message = self.client.decode(message)
         if message.msg_type == HiveMessageType.HELLO:
             self._remember_hello_session(message)
         message = self._hydrate_bus_session(message)
-        source_ip = getattr(self.client, "source_ip", None)
-        source_label = f" from {source_ip}" if source_ip else ""
+        peer = self._peer_label(self.client.peer)
         if (
                 message.msg_type == HiveMessageType.BUS
                 and message.payload.msg_type == "recognizer_loop:b64_audio"
         ):
-            LOG.info(f"Received {self.client.peer}{source_label} sent base64 audio for STT")
+            LOG.info(f"Received {peer} sent base64 audio for STT")
         else:
-            LOG.info(f"Received {self.client.peer}{source_label} message: {message}")
+            LOG.info(f"Received {peer} message: {message}")
         self.hm_protocol.handle_message(message, self.client)
+
+    def _peer_label(self, peer: str) -> str:
+        return f"{peer} ({self.source_ip})" if self.source_ip else peer
 
     def open(self) -> None:
         """
         Handle a new client connection and perform authorization.
         """
-        source_ip = self._connection_ip()
-        auth = self._query_argument(getattr(self.request, "query", None), "authorization")
+        self.source_ip = self._client_ip()
+        auth = self.get_query_argument("authorization", None)
         try:
             useragent, key = self.decode_auth(auth)
         except ValueError as e:
-            LOG.warning(f"Rejecting websocket connection from {source_ip or 'unknown'}: {e}")
-            self.close(code=1008, reason=str(e))
+            LOG.warning(
+                f"rejecting websocket from {self.source_ip or self.request.remote_ip}: "
+                f"bad authorization ({e.__class__.__name__}: {e})"
+            )
+            self.close(code=1008, reason="invalid authorization")
             return
-        LOG.info(f"Authorizing client from {source_ip or 'unknown'} - {useragent}")
+        LOG.info(f"Authorizing client from {self.source_ip or 'unknown'} - {useragent}")
 
         def do_send(payload: str, is_bin: bool):
             self.loop.install()  # TODO is this needed?
@@ -395,7 +297,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             name=useragent,
             hm_protocol=self.hm_protocol
         )
-        self.client.source_ip = source_ip
+        self.client.source_ip = self.source_ip
         self.hm_protocol.db.sync()
         user: Client = self.hm_protocol.db.get_client_by_api_key(key)
 
@@ -407,7 +309,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
 
         self.client.name = f"{useragent}::{user.client_id}::{user.name}"
         self.client.crypto_key = user.crypto_key
-        self.client.msg_blacklist = user.message_blacklist or []
+        self.client.msg_blacklist = getattr(user, "message_blacklist", None) or []
         self.client.skill_blacklist = user.skill_blacklist or []
         self.client.intent_blacklist = user.intent_blacklist or []
         self.client.allowed_types = user.allowed_types
@@ -441,11 +343,12 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     def on_close(self):
         client = getattr(self, "client", None)
         if client is None:
-            LOG.debug("disconnecting unauthenticated websocket client")
+            LOG.debug(
+                f"closing unauthenticated websocket from {self.request.remote_ip} "
+                f"(no client was ever attached)"
+            )
             return
-        source_ip = getattr(client, "source_ip", None)
-        source_label = f" from {source_ip}" if source_ip else ""
-        LOG.info(f"disconnecting client: {client.peer}{source_label}")
+        LOG.info(f"disconnecting client: {self._peer_label(client.peer)}")
         self.hm_protocol.handle_client_disconnected(client)
 
     def check_origin(self, origin) -> bool:
