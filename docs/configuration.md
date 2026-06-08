@@ -29,6 +29,16 @@ strings. The feature is **inactive** unless at least one CIDR is configured.
 
 When inactive, `remote_ip` from the Tornado request is used as-is.
 
+## WebSocket heartbeat
+
+| Key | Env var | Default | Description |
+|---|---|---|---|
+| `websocket_ping_interval` | `HIVEMIND_WEBSOCKET_PING_INTERVAL` | `30.0` | Seconds between WebSocket ping frames. |
+| `websocket_ping_timeout` | `HIVEMIND_WEBSOCKET_PING_TIMEOUT` | `20.0` | Seconds to wait for pong before closing the connection. |
+
+These values are passed to Tornado's WebSocket server settings. Invalid,
+negative, or non-finite values fall back to the defaults.
+
 ### Example — nginx on localhost
 
 ```bash

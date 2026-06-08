@@ -12,10 +12,13 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from tornado.platform.asyncio import AnyThreadEventLoopPolicy
 import asyncio
 
 from hivemind_websocket_protocol import (
+    DEFAULT_WEBSOCKET_PING_INTERVAL,
+    DEFAULT_WEBSOCKET_PING_TIMEOUT,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
 )
@@ -34,6 +37,66 @@ def test_version_module_exposes_constants_and_string():
     assert v.__version__.startswith(
         f"{v.VERSION_MAJOR}.{v.VERSION_MINOR}.{v.VERSION_BUILD}"
     )
+
+
+# --- websocket ping settings -----------------------------------------------
+
+def test_websocket_ping_settings_default(monkeypatch):
+    monkeypatch.delenv("HIVEMIND_WEBSOCKET_PING_INTERVAL", raising=False)
+    monkeypatch.delenv("HIVEMIND_WEBSOCKET_PING_TIMEOUT", raising=False)
+    proto = HiveMindWebsocketProtocol(config={})
+
+    assert proto._websocket_ping_settings() == {
+        "websocket_ping_interval": DEFAULT_WEBSOCKET_PING_INTERVAL,
+        "websocket_ping_timeout": DEFAULT_WEBSOCKET_PING_TIMEOUT,
+    }
+
+
+def test_websocket_ping_settings_from_env(monkeypatch):
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_INTERVAL", "25")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_TIMEOUT", "15")
+    proto = HiveMindWebsocketProtocol(config={})
+
+    assert proto._websocket_ping_settings() == {
+        "websocket_ping_interval": 25.0,
+        "websocket_ping_timeout": 15.0,
+    }
+
+
+def test_websocket_ping_settings_config_wins_over_env(monkeypatch):
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_INTERVAL", "25")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_TIMEOUT", "15")
+    proto = HiveMindWebsocketProtocol(
+        config={"websocket_ping_interval": 10, "websocket_ping_timeout": 5}
+    )
+
+    assert proto._websocket_ping_settings() == {
+        "websocket_ping_interval": 10.0,
+        "websocket_ping_timeout": 5.0,
+    }
+
+
+def test_websocket_ping_settings_invalid_values_fall_back(monkeypatch):
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_INTERVAL", "-1")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_TIMEOUT", "nope")
+    proto = HiveMindWebsocketProtocol(config={})
+
+    assert proto._websocket_ping_settings() == {
+        "websocket_ping_interval": DEFAULT_WEBSOCKET_PING_INTERVAL,
+        "websocket_ping_timeout": DEFAULT_WEBSOCKET_PING_TIMEOUT,
+    }
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_websocket_ping_settings_non_finite_values_fall_back(monkeypatch, value):
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_INTERVAL", value)
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PING_TIMEOUT", value)
+    proto = HiveMindWebsocketProtocol(config={})
+
+    assert proto._websocket_ping_settings() == {
+        "websocket_ping_interval": DEFAULT_WEBSOCKET_PING_INTERVAL,
+        "websocket_ping_timeout": DEFAULT_WEBSOCKET_PING_TIMEOUT,
+    }
 
 
 # --- self-signed cert generation ------------------------------------------
@@ -200,4 +263,3 @@ def test_run_ssl_path_generates_missing_cert(tmp_path):
     assert not t.is_alive()
     assert (cert_dir / "gen-me.crt").exists()
     assert (cert_dir / "gen-me.key").exists()
-
