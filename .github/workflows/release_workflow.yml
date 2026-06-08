@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
   pull-requests: write
 
 jobs:
@@ -25,4 +26,4 @@ jobs:
       propose_release: true
       changelog_max_issues: 50
       publish_pypi: true
-      notify_matrix: true
+      notify_matrix: false
