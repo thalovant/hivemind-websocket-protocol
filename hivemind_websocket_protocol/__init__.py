@@ -19,7 +19,6 @@ from ovos_utils.xdg_utils import xdg_data_home
 from poorman_handshake import PasswordHandShake
 from tornado import ioloop
 from tornado import web
-from tornado.platform.asyncio import AnyThreadEventLoopPolicy
 from tornado.websocket import WebSocketHandler
 
 from hivemind_bus_client.message import HiveMessageType
@@ -103,8 +102,11 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
 
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
-        HiveMindTornadoWebSocket.loop = ioloop.IOLoop.current()
+        asyncio_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(asyncio_loop)
+        loop = ioloop.IOLoop()
+        loop.make_current()
+        HiveMindTornadoWebSocket.loop = loop
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
 
         if "trusted_proxy_cidrs" in self.config:
@@ -153,7 +155,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             LOG.info("ws listener started")
             application.listen(port, host)
 
-        HiveMindTornadoWebSocket.loop.start()  # blocking
+        loop.start()  # blocking
 
     @staticmethod
     def create_self_signed_cert(

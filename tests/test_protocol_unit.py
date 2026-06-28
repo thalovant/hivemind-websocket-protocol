@@ -13,8 +13,6 @@ import time
 from pathlib import Path
 
 import pytest
-from tornado.platform.asyncio import AnyThreadEventLoopPolicy
-import asyncio
 
 from hivemind_websocket_protocol import (
     DEFAULT_WEBSOCKET_PING_INTERVAL,
@@ -135,7 +133,7 @@ def _free_port() -> int:
 
 
 def test_run_starts_and_serves_on_plain_ws():
-    """Calling proto.run() actually binds the port and starts the ioloop."""
+    """Calling proto.run() binds and services a real websocket upgrade."""
     master = MasterNode.create("MX", require_crypto=False, handshake_enabled=True)
     port = _free_port()
     proto = HiveMindWebsocketProtocol(
@@ -152,37 +150,39 @@ def test_run_starts_and_serves_on_plain_ws():
     started = threading.Event()
 
     def _run():
-        # run() calls IOLoop.current() inside; needs the policy on this thread.
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
-        # Schedule a stop right after the loop is up.
-        threading.Thread(target=_stop_when_ready, daemon=True).start()
         started.set()
         proto.run()
 
-    def _stop_when_ready():
-        # Wait for run() to install the class-level loop reference, then stop it.
+    def _wait_for_loop():
         for _ in range(200):
             loop = getattr(HiveMindTornadoWebSocket, "loop", None)
             if loop is not None and getattr(loop, "asyncio_loop", None) is not None:
-                # Give the loop a moment to actually start before stopping it.
-                time.sleep(0.1)
-                loop.add_callback(loop.stop)
-                return
+                return loop
             time.sleep(0.05)
+        raise AssertionError("run() did not install a Tornado IOLoop")
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     assert started.wait(2)
-    # Give run() a beat to bind + start.
-    time.sleep(0.3)
-    # While it's running, the port should be listening.
+    loop = _wait_for_loop()
+
     s = socket.socket()
     try:
         s.settimeout(1)
         s.connect(("127.0.0.1", port))
+        s.sendall(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            b"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        assert b"101 Switching Protocols" in s.recv(512)
     finally:
         s.close()
-    # The stop callback should have stopped the loop; join the thread.
+        loop.add_callback(loop.stop)
+
     t.join(timeout=5)
     assert not t.is_alive(), "run() did not return after ioloop.stop()"
 
@@ -214,7 +214,6 @@ def test_run_ssl_path_uses_existing_cert(tmp_path):
             time.sleep(0.05)
 
     def _run():
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
         threading.Thread(target=_stop_when_ready, daemon=True).start()
         started.set()
         proto.run()
@@ -251,7 +250,6 @@ def test_run_ssl_path_generates_missing_cert(tmp_path):
             time.sleep(0.05)
 
     def _run():
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
         threading.Thread(target=_stop_when_ready, daemon=True).start()
         started.set()
         proto.run()
