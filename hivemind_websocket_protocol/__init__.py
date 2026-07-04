@@ -25,6 +25,14 @@ from tornado.iostream import StreamClosedError
 from tornado.websocket import WebSocketClosedError, WebSocketHandler
 
 from hivemind_bus_client.message import HiveMessageType
+try:
+    from hivemind_core.config import runtime_password_min_bits
+except ImportError:  # released hivemind-core without the helper
+    import os
+
+    def runtime_password_min_bits():
+        return 0.0 if os.environ.get("HIVEMIND_DISABLE_PASSWORD_STRENGTH_CHECK", "").strip().lower() in ("1", "true", "yes", "on") else 40.0
+
 from hivemind_core.protocol import (
     HiveMindListenerProtocol,
     HiveMindClientConnection,
@@ -458,7 +466,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.is_admin = user.is_admin
         if user.password:
             # pre-shared password to derive aes_key
-            self.client.pswd_handshake = PasswordHandShake(user.password)
+            self.client.pswd_handshake = PasswordHandShake(user.password, min_bits=runtime_password_min_bits())
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
 
