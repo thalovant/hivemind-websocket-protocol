@@ -17,9 +17,9 @@ from hivemind_bus_client import HiveMessageBusClient
 
 # --- helpers --------------------------------------------------------------
 
-def _client(server, *, useragent="e2e", password=None):
+def _client(server, *, useragent="e2e", key=None, password=None):
     c = HiveMessageBusClient(
-        key=server.api_key,
+        key=key if key is not None else server.api_key,
         password=password if password is not None else server.password,
         host=server.host,
         port=server.port,
@@ -28,7 +28,7 @@ def _client(server, *, useragent="e2e", password=None):
         compress=False,
         binarize=False,
     )
-    c.connect()
+    c.connect(handshake_max_retries=2)
     assert c.handshake_event.is_set(), "handshake did not complete"
     return c
 
@@ -70,8 +70,18 @@ def test_disconnect_releases_client_on_listener(tornado_server):
 
 
 def test_multiple_concurrent_clients(tornado_server):
+    secondary_key = "test-api-key-secondary"
+    tornado_server.master.register_satellite(
+        secondary_key,
+        password=tornado_server.password,
+        allowed_types=[
+            "recognizer_loop:utterance",
+            "recognizer_loop:b64_audio",
+            "speak",
+        ],
+    )
     a = _client(tornado_server, useragent="ua-a")
-    b = _client(tornado_server, useragent="ua-b")
+    b = _client(tornado_server, useragent="ua-b", key=secondary_key)
     try:
         _wait_clients(tornado_server, 2)
         assert len(tornado_server.listener.clients) == 2
@@ -94,7 +104,7 @@ def test_bad_api_key_is_rejected(tornado_server):
     )
     # connect() raises if handshake times out; catch that.
     with pytest.raises(RuntimeError):
-        bad.connect()
+        bad.connect(handshake_max_retries=0)
     bad.close()
     _wait(lambda: not tornado_server.listener.clients, timeout=2)
     assert not tornado_server.listener.clients
