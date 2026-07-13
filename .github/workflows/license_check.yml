@@ -1,3 +1,6 @@
+permissions:
+  contents: read
+
 name: License Check
 
 on:
@@ -7,4 +10,4 @@ on:
 
 jobs:
   license_check:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/license-check.yml@dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/license-check.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev

@@ -1,3 +1,7 @@
+permissions:
+  contents: write
+  pull-requests: write
+
 name: Code Coverage
 
 on:
@@ -7,7 +11,7 @@ on:
 
 jobs:
   coverage:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev
     with:
       python_version: '3.11'
       coverage_source: 'hivemind_websocket_protocol'
