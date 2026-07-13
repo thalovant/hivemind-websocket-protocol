@@ -75,6 +75,7 @@ def _spawn_tornado(trusted_networks=(), trusted_headers=()):
     teardown via `_teardown_tornado(thread, loop)`.
     """
     api_key = "test-api-key"
+    # Test-only high-entropy input; the handshake rejects weak shared secrets.
     password = "8dnC4qvX2jK7mP9rT5wY3zL6sH1fB0aQ"
 
     master = MasterNode.create("M0", require_crypto=False, handshake_enabled=True)
