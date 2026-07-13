@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1a5](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a5) (2026-07-13)
+
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.1a3...0.2.1a5)
+
+**Merged pull requests:**
+
+- Harden organization security controls [\#4](https://github.com/thalovant/hivemind-websocket-protocol/pull/4) ([goldyfruit](https://github.com/goldyfruit))
+
+## [0.2.1a3](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a3) (2026-06-08)
+
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.1a2...0.2.1a3)
+
 ## [0.2.1a2](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a2) (2026-06-08)
 
 [Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.0.4a1...0.2.1a2)
