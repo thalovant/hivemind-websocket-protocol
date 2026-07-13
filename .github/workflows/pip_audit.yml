@@ -1,3 +1,6 @@
+permissions:
+  contents: read
+
 name: PIP Audit
 
 on:
@@ -7,4 +10,4 @@ on:
 
 jobs:
   pip_audit:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/pip-audit.yml@dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/pip-audit.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev
