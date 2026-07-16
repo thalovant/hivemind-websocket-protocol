@@ -10,6 +10,7 @@ import os
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -20,10 +21,13 @@ from hivemind_plugin_manager.database import AbstractRemoteDB
 from hivemind_websocket_protocol import (
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
+    _HANDSHAKE_TEMPLATE_CACHE,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
+    _new_client_handshake,
     _refresh_local_client_database,
 )
+import hivemind_websocket_protocol as websocket_protocol
 from hivescope.node import MasterNode
 
 
@@ -61,6 +65,67 @@ def test_authorization_never_repairs_remote_database():
         assert _refresh_local_client_database(database) is False
 
     database.sync.assert_not_called()
+
+
+# --- listener handshake key cache -----------------------------------------
+
+class _FakeHandshake:
+    created = 0
+
+    def __init__(self, path):
+        type(self).created += 1
+        self.private_key = object()
+        self.path = path
+        self.target_key = None
+        self.secret = None
+
+
+@pytest.fixture
+def fake_handshake(monkeypatch):
+    _FakeHandshake.created = 0
+    _HANDSHAKE_TEMPLATE_CACHE.clear()
+    monkeypatch.setattr(websocket_protocol, "HandShake", _FakeHandshake)
+    yield _FakeHandshake
+    _HANDSHAKE_TEMPLATE_CACHE.clear()
+
+
+def test_client_handshake_reuses_key_parse_with_isolated_state(tmp_path, fake_handshake):
+    key_path = tmp_path / "listener.pem"
+    key_path.write_text("listener-key-v1")
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        handshakes = list(executor.map(lambda _: _new_client_handshake(str(key_path)), range(400)))
+
+    assert fake_handshake.created == 1
+    assert len({id(handshake) for handshake in handshakes}) == 400
+    assert len({id(handshake.private_key) for handshake in handshakes}) == 1
+
+    handshakes[0].target_key = object()
+    handshakes[0].secret = b"connection-local"
+    assert all(handshake.target_key is None for handshake in handshakes[1:])
+    assert all(handshake.secret is None for handshake in handshakes[1:])
+
+
+def test_client_handshake_reloads_rotated_key(tmp_path, fake_handshake):
+    key_path = tmp_path / "listener.pem"
+    key_path.write_text("listener-key-v1")
+    first = _new_client_handshake(str(key_path))
+
+    key_path.write_text("listener-key-v2-with-a-different-size")
+    second = _new_client_handshake(str(key_path))
+
+    assert fake_handshake.created == 2
+    assert first.private_key is not second.private_key
+
+
+def test_client_handshake_does_not_cache_missing_key(fake_handshake, tmp_path):
+    missing = tmp_path / "missing.pem"
+
+    first = _new_client_handshake(str(missing))
+    second = _new_client_handshake(str(missing))
+
+    assert fake_handshake.created == 2
+    assert first.private_key is not second.private_key
 
 
 # --- websocket ping settings -----------------------------------------------
