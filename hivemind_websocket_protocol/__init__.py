@@ -6,6 +6,7 @@ import math
 import os
 import os.path
 import random
+import time
 from os import makedirs
 from os.path import exists, join
 from threading import Lock
@@ -28,10 +29,12 @@ from hivemind_bus_client.message import HiveMessageType
 try:
     from hivemind_core.config import runtime_password_min_bits
 except ImportError:  # released hivemind-core without the helper
-    import os
-
     def runtime_password_min_bits():
-        return 0.0 if os.environ.get("HIVEMIND_DISABLE_PASSWORD_STRENGTH_CHECK", "").strip().lower() in ("1", "true", "yes", "on") else 40.0
+        disabled = os.environ.get(
+            "HIVEMIND_DISABLE_PASSWORD_STRENGTH_CHECK",
+            "",
+        ).strip().lower()
+        return 0.0 if disabled in ("1", "true", "yes", "on") else 40.0
 
 from hivemind_core.protocol import (
     HiveMindListenerProtocol,
@@ -99,7 +102,10 @@ def _refresh_local_client_database(database: Any) -> bool:
     backend = getattr(database, "db", database)
     if isinstance(backend, AbstractRemoteDB):
         return False
-    database.sync()
+    sync = getattr(database, "sync", None)
+    if not callable(sync):
+        return False
+    sync()
     return True
 
 
@@ -195,8 +201,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
-        loop = ioloop.IOLoop()
-        loop.make_current()
+        loop = ioloop.IOLoop.current()
         HiveMindTornadoWebSocket.loop = loop
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
 
@@ -230,7 +235,10 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             trusted_headers=trusted_headers,
             **websocket_ping_settings,
         )
+        startup_error: Optional[Exception] = None
+
         def start_listener() -> None:
+            nonlocal startup_error
             try:
                 if ssl:
                     cert_file = f"{cert_dir}/{cert_name}.crt"
@@ -249,13 +257,15 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                 else:
                     application.listen(port, host)
                     LOG.info("ws listener started")
-            except Exception:
+            except Exception as error:
+                startup_error = error
                 LOG.exception("failed to start websocket listener")
                 loop.stop()
 
         loop.add_callback(start_listener)
-
         loop.start()  # blocking
+        if startup_error is not None:
+            raise startup_error
 
     @staticmethod
     def create_self_signed_cert(
@@ -313,6 +323,10 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     """
     hm_protocol = None
     source_ip: Optional[str] = None
+    _sync_lock = Lock()
+    _last_sync_ts = 0.0
+    _last_sync_error: Optional[Exception] = None
+    _sync_debounce_s = 1.0
 
     @staticmethod
     def _serialized_session(session: Any) -> dict[str, Any]:
@@ -402,13 +416,37 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 message.msg_type == HiveMessageType.BUS
                 and message.payload.msg_type == "recognizer_loop:b64_audio"
         ):
-            LOG.info(f"Received {peer} sent base64 audio for STT")
+            LOG.debug(f"Received {peer} sent base64 audio for STT")
         else:
-            LOG.info(f"Received {peer} message: {message}")
+            LOG.debug(f"Received {peer} message: {message}")
         self.hm_protocol.handle_message(message, self.client)
 
     def _peer_label(self, peer: str) -> str:
         return f"{peer} ({self.source_ip})" if self.source_ip else peer
+
+    @classmethod
+    def _sync_client_database(cls, database: Any) -> bool:
+        """Debounce local database reloads after an API-key cache miss."""
+        backend = getattr(database, "db", database)
+        if isinstance(backend, AbstractRemoteDB):
+            return False
+        if not callable(getattr(database, "sync", None)):
+            return False
+
+        with cls._sync_lock:
+            now = time.monotonic()
+            if now - cls._last_sync_ts < cls._sync_debounce_s:
+                if cls._last_sync_error is not None:
+                    raise cls._last_sync_error
+                return True
+            cls._last_sync_ts = now
+            try:
+                refreshed = _refresh_local_client_database(database)
+            except Exception as error:
+                cls._last_sync_error = error
+                raise
+            cls._last_sync_error = None
+            return refreshed
 
     def open(self) -> None:
         """
@@ -425,15 +463,18 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             )
             self.close(code=1008, reason="invalid authorization")
             return
-        LOG.info(f"Authorizing client from {self.source_ip or 'unknown'} - {useragent}")
+        LOG.debug(f"Authorizing client from {self.source_ip or 'unknown'} - {useragent}")
 
         def do_send(payload: str, is_bin: bool):
-            self.loop.install()  # TODO is this needed?
-            _write_websocket_message(self, payload, is_bin)
+            self.loop.add_callback(
+                _write_websocket_message,
+                self,
+                payload,
+                is_bin,
+            )
 
         def do_disconnect():
-            self.loop.install()  # TODO is this needed?
-            self.close()
+            self.loop.add_callback(self.close)
 
         self.client = HiveMindClientConnection(
             key=key,
@@ -445,10 +486,25 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             handshake=_new_client_handshake(self.hm_protocol.identity.private_key),
         )
         self.client.source_ip = self.source_ip
-        _refresh_local_client_database(self.hm_protocol.db)
         user: Client = self.hm_protocol.db.get_client_by_api_key(key)
+        sync_error = False
+        if not user:
+            try:
+                refreshed = self._sync_client_database(self.hm_protocol.db)
+            except Exception:
+                sync_error = True
+                LOG.exception(
+                    "Client database sync failed while retrying API-key lookup"
+                )
+            else:
+                if refreshed:
+                    user = self.hm_protocol.db.get_client_by_api_key(key)
 
         if not user:
+            if sync_error:
+                LOG.error("Client database unavailable during API-key lookup")
+                self.close(code=1011, reason="client database unavailable")
+                return
             LOG.error("Client provided an invalid api key")
             self.hm_protocol.handle_invalid_key_connected(self.client)
             self.close()
@@ -456,7 +512,6 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
 
         self.client.name = f"{useragent}::{user.client_id}::{user.name}"
         self.client.crypto_key = user.crypto_key
-        self.client.msg_blacklist = getattr(user, "message_blacklist", None) or []
         self.client.skill_blacklist = user.skill_blacklist or []
         self.client.intent_blacklist = user.intent_blacklist or []
         self.client.allowed_types = user.allowed_types
@@ -495,7 +550,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 f"(no client was ever attached)"
             )
             return
-        LOG.info(f"disconnecting client: {self._peer_label(client.peer)}")
+        LOG.debug(f"disconnecting client: {self._peer_label(client.peer)}")
         self.hm_protocol.handle_client_disconnected(client)
 
     def check_origin(self, origin) -> bool:
