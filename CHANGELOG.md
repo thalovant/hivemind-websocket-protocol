@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1a6](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a6) (2026-07-16)
+
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.1a5...0.2.1a6)
+
+**Merged pull requests:**
+
+- Skip remote database repair during WSS auth [\#5](https://github.com/thalovant/hivemind-websocket-protocol/pull/5) ([goldyfruit](https://github.com/goldyfruit))
+
 ## [0.2.1a5](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a5) (2026-07-13)
 
 [Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.1a3...0.2.1a5)
