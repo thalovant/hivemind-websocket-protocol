@@ -11,14 +11,18 @@ import socket
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+from hivemind_plugin_manager.database import AbstractRemoteDB
 
 from hivemind_websocket_protocol import (
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
+    _refresh_local_client_database,
 )
 from hivescope.node import MasterNode
 
@@ -35,6 +39,28 @@ def test_version_module_exposes_constants_and_string():
     assert v.__version__.startswith(
         f"{v.VERSION_MAJOR}.{v.VERSION_MINOR}.{v.VERSION_BUILD}"
     )
+
+
+# --- database refresh ------------------------------------------------------
+
+def test_authorization_refreshes_file_backed_database():
+    database = SimpleNamespace(db=object(), sync=Mock())
+
+    assert _refresh_local_client_database(database) is True
+
+    database.sync.assert_called_once_with()
+
+
+def test_authorization_never_repairs_remote_database():
+    database = SimpleNamespace(
+        db=Mock(spec=AbstractRemoteDB),
+        sync=Mock(side_effect=AssertionError("remote sync entered WSS auth path")),
+    )
+
+    for _ in range(400):
+        assert _refresh_local_client_database(database) is False
+
+    database.sync.assert_not_called()
 
 
 # --- websocket ping settings -----------------------------------------------
