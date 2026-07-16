@@ -102,7 +102,8 @@ def test_bad_api_key_is_rejected(tornado_server):
         useragent="bad-key",
         self_signed=False,
     )
-    # connect() raises if handshake times out; catch that.
+    # bound the handshake retries so a rejected key fails fast instead of
+    # reconnecting forever
     with pytest.raises(RuntimeError):
         bad.connect(handshake_max_retries=0)
     bad.close()

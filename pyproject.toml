@@ -14,16 +14,12 @@ requires-python = ">=3.10"
 dependencies = [
     "tornado",
     "hivemind-plugin-manager",
-    "poorman_handshake>=0.1.0",
+    "poorman-handshake>=2.0.0a1,<3.0.0",
+    "hivemind-core",
     "pyOpenSSL",
     "pybase64",
 ]
 
-# The plugin is loaded by hivemind-core at runtime, which brings
-# hivemind-core / hivemind-bus-client / ovos-bus-client / ovos-utils
-# along for free. They are only declared here so the test suite can
-# import the package standalone in CI. hivemind-core is AGPL; do not
-# promote it to a runtime dep.
 [project.optional-dependencies]
 test = [
     "pytest",
