@@ -1,5 +1,6 @@
 import asyncio
 import binascii
+import copy
 import dataclasses
 import math
 import os
@@ -7,6 +8,7 @@ import os.path
 import random
 from os import makedirs
 from os.path import exists, join
+from threading import Lock
 from socket import gethostname
 from typing import Dict, Any, Optional, Tuple
 
@@ -16,7 +18,7 @@ from hivemind_plugin_manager.protocols import NetworkProtocol
 from ovos_bus_client.session import Session
 from ovos_utils.log import LOG
 from ovos_utils.xdg_utils import xdg_data_home
-from poorman_handshake import PasswordHandShake
+from poorman_handshake import HandShake, PasswordHandShake
 from tornado import ioloop
 from tornado import web
 from tornado.websocket import WebSocketHandler
@@ -39,6 +41,48 @@ from hivemind_websocket_protocol._client_ip import (
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
+
+
+_HANDSHAKE_TEMPLATE_CACHE: Dict[
+    str,
+    Tuple[Tuple[str, int, int, int, int], HandShake],
+] = {}
+_HANDSHAKE_TEMPLATE_LOCK = Lock()
+
+
+def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
+    """Return a cheap rotation-aware fingerprint for a listener private key."""
+    if not path or not os.path.isfile(path):
+        return None
+    resolved = os.path.realpath(path)
+    stat = os.stat(resolved)
+    return resolved, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _new_client_handshake(path: Optional[str]) -> HandShake:
+    """Create isolated handshake state without reparsing an unchanged RSA key."""
+    fingerprint = _private_key_fingerprint(path)
+    if fingerprint is None:
+        return HandShake(path)
+
+    cache_key = os.path.abspath(path)
+    with _HANDSHAKE_TEMPLATE_LOCK:
+        cached = _HANDSHAKE_TEMPLATE_CACHE.get(cache_key)
+        if cached is None or cached[0] != fingerprint:
+            template = HandShake(path)
+            current_fingerprint = _private_key_fingerprint(path)
+            if current_fingerprint is None:
+                return template
+            _HANDSHAKE_TEMPLATE_CACHE[cache_key] = (current_fingerprint, template)
+        else:
+            template = cached[1]
+
+        handshake = copy.copy(template)
+
+    # These fields are connection-local and must never leak across copies.
+    handshake.target_key = None
+    handshake.secret = None
+    return handshake
 
 
 def _refresh_local_client_database(database: Any) -> bool:
@@ -359,7 +403,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             send_msg=do_send,
             sess=Session(session_id="default"),  # will be re-assigned once client sends handshake
             name=useragent,
-            hm_protocol=self.hm_protocol
+            hm_protocol=self.hm_protocol,
+            handshake=_new_client_handshake(self.hm_protocol.identity.private_key),
         )
         self.client.source_ip = self.source_ip
         _refresh_local_client_database(self.hm_protocol.db)
