@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/build-tests.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/build-tests.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev
     with:
       python_versions: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
       install_extras: 'test'

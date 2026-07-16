@@ -8,6 +8,11 @@ updates:
       time: "08:40"
       timezone: America/Toronto
     open-pull-requests-limit: 5
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     groups:
       routine-updates:
         applies-to: version-updates
@@ -24,6 +29,11 @@ updates:
       time: "08:40"
       timezone: America/Toronto
     open-pull-requests-limit: 5
+    allow:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     groups:
       routine-updates:
         applies-to: version-updates
