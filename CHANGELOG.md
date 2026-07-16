@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2a1](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.2a1) (2026-07-16)
+
+[Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.1a7...0.2.2a1)
+
+**Merged pull requests:**
+
+- fix: repair reusable CI permissions [\#7](https://github.com/thalovant/hivemind-websocket-protocol/pull/7) ([goldyfruit](https://github.com/goldyfruit))
+
 ## [0.2.1a7](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.1a7) (2026-07-16)
 
 [Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.1a6...0.2.1a7)
