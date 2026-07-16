@@ -12,6 +12,6 @@ on:
 
 jobs:
   pip_audit:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/pip-audit.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/pip-audit.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev
     with:
       pr_comment: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
