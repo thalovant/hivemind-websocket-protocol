@@ -21,7 +21,8 @@ from ovos_utils.xdg_utils import xdg_data_home
 from poorman_handshake import HandShake, PasswordHandShake
 from tornado import ioloop
 from tornado import web
-from tornado.websocket import WebSocketHandler
+from tornado.iostream import StreamClosedError
+from tornado.websocket import WebSocketClosedError, WebSocketHandler
 
 from hivemind_bus_client.message import HiveMessageType
 from hivemind_core.protocol import (
@@ -92,6 +93,35 @@ def _refresh_local_client_database(database: Any) -> bool:
         return False
     database.sync()
     return True
+
+
+def _finish_websocket_write(future: Any) -> None:
+    """Consume asynchronous write failures so closed peers stay routine."""
+    if future.cancelled():
+        return
+    error = future.exception()
+    if error is None:
+        return
+    if isinstance(error, (WebSocketClosedError, StreamClosedError)):
+        LOG.debug("HiveMind websocket closed before a queued write completed")
+        return
+    LOG.error(
+        "HiveMind websocket write failed: "
+        f"{type(error).__name__}: {error!r}"
+    )
+
+
+def _write_websocket_message(handler: WebSocketHandler,
+                             payload: str,
+                             is_binary: bool) -> None:
+    """Write a frame and observe both synchronous and future failures."""
+    try:
+        future = handler.write_message(payload, is_binary)
+    except (WebSocketClosedError, StreamClosedError):
+        LOG.debug("HiveMind websocket closed before a frame could be queued")
+        return
+    if future is not None:
+        future.add_done_callback(_finish_websocket_write)
 
 
 def _split_csv(value: Any) -> Tuple[str, ...]:
@@ -391,7 +421,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
 
         def do_send(payload: str, is_bin: bool):
             self.loop.install()  # TODO is this needed?
-            self.write_message(payload, is_bin)
+            _write_websocket_message(self, payload, is_bin)
 
         def do_disconnect():
             self.loop.install()  # TODO is this needed?

@@ -10,13 +10,14 @@ import os
 import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from hivemind_plugin_manager.database import AbstractRemoteDB
+from tornado.websocket import WebSocketClosedError
 
 from hivemind_websocket_protocol import (
     DEFAULT_WEBSOCKET_PING_INTERVAL,
@@ -24,8 +25,10 @@ from hivemind_websocket_protocol import (
     _HANDSHAKE_TEMPLATE_CACHE,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
+    _finish_websocket_write,
     _new_client_handshake,
     _refresh_local_client_database,
+    _write_websocket_message,
 )
 import hivemind_websocket_protocol as websocket_protocol
 from hivescope.node import MasterNode
@@ -65,6 +68,25 @@ def test_authorization_never_repairs_remote_database():
         assert _refresh_local_client_database(database) is False
 
     database.sync.assert_not_called()
+
+
+def test_closed_websocket_write_future_is_consumed():
+    future = Future()
+    future.set_exception(WebSocketClosedError())
+
+    _finish_websocket_write(future)
+
+    assert future.exception() is not None
+
+
+def test_synchronous_closed_websocket_write_is_routine():
+    handler = SimpleNamespace(
+        write_message=Mock(side_effect=WebSocketClosedError()),
+    )
+
+    _write_websocket_message(handler, "payload", False)
+
+    handler.write_message.assert_called_once_with("payload", False)
 
 
 # --- listener handshake key cache -----------------------------------------
