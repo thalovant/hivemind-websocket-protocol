@@ -12,12 +12,11 @@ jobs:
   publish_stable:
     if: github.actor != 'github-actions[bot]'
     uses: OpenVoiceOS/gh-automations/.github/workflows/publish-stable.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-      MATRIX_TOKEN: ${{ secrets.MATRIX_TOKEN }}
     with:
       version_file: 'hivemind_websocket_protocol/version.py'
-      publish_pypi: true
+      # This fork has no PyPI publisher. Publish source releases until one is
+      # configured explicitly instead of attempting an untrusted OIDC upload.
+      publish_pypi: false
       publish_release: true
       sync_dev: true
-      notify_matrix: true
+      notify_matrix: false
