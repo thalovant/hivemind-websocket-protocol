@@ -28,7 +28,7 @@ from hivemind_core.protocol import (
     HiveMindNodeType
 )
 from hivemind_plugin_manager.protocols import ClientCallbacks
-from hivemind_plugin_manager.database import Client
+from hivemind_plugin_manager.database import AbstractRemoteDB, Client
 
 from hivemind_websocket_protocol._client_ip import (
     parse_networks,
@@ -39,6 +39,15 @@ from hivemind_websocket_protocol._client_ip import (
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
+
+
+def _refresh_local_client_database(database: Any) -> bool:
+    """Reload file-backed clients without repairing a live remote database."""
+    backend = getattr(database, "db", database)
+    if isinstance(backend, AbstractRemoteDB):
+        return False
+    database.sync()
+    return True
 
 
 def _split_csv(value: Any) -> Tuple[str, ...]:
@@ -353,7 +362,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             hm_protocol=self.hm_protocol
         )
         self.client.source_ip = self.source_ip
-        self.hm_protocol.db.sync()
+        _refresh_local_client_database(self.hm_protocol.db)
         user: Client = self.hm_protocol.db.get_client_by_api_key(key)
 
         if not user:
