@@ -22,6 +22,8 @@ from hivemind_plugin_manager.database import AbstractRemoteDB
 from tornado.websocket import WebSocketClosedError
 
 from hivemind_websocket_protocol import (
+    DEFAULT_AUTH_EXECUTOR_WORKERS,
+    DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
     _HANDSHAKE_TEMPLATE_CACHE,
@@ -558,6 +560,47 @@ def test_open_keeps_password_validation_off_event_loop(open_handler, monkeypatch
 
     assert elapsed < 0.25
     assert all(handler.client.pswd_handshake.password == user.password for handler in handlers)
+
+
+def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeypatch):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+    auth_executor = object()
+    handshake_executor = object()
+    calls = []
+    db = SimpleNamespace(
+        db=Mock(spec=AbstractRemoteDB),
+        get_client_by_api_key=lambda key: user,
+    )
+    handler = open_handler(db, seen_clients=[])
+    handler.auth_executor = auth_executor
+    handler.handshake_executor = handshake_executor
+
+    async def run_in_executor(executor, callback, *args):
+        calls.append((executor, callback))
+        return callback(*args)
+
+    handler.loop = SimpleNamespace(
+        add_callback=lambda callback, *args, **kwargs: callback(*args, **kwargs),
+        run_in_executor=run_in_executor,
+    )
+    monkeypatch.setattr(
+        websocket_protocol,
+        "_new_password_handshake",
+        lambda password: SimpleNamespace(password=password),
+    )
+
+    _run_open(handler)
+
+    assert calls == [
+        (auth_executor, db.get_client_by_api_key),
+        (handshake_executor, websocket_protocol._new_password_handshake),
+    ]
+
+
+def test_executor_worker_defaults_cover_guarded_admission_burst():
+    assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
+    assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
 
 
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):
