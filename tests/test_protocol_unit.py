@@ -6,6 +6,7 @@ Targets:
 - `create_self_signed_cert()` certificate / key generation.
 - version.py module loading.
 """
+import asyncio
 import os
 import socket
 import threading
@@ -256,6 +257,11 @@ def _open_handler(db, key="api-key", seen_clients=None,
     handler.application = SimpleNamespace(settings={})
     handler.loop = SimpleNamespace(
         add_callback=lambda callback, *args, **kwargs: callback(*args, **kwargs),
+        run_in_executor=lambda executor, callback, *args: (
+            asyncio.get_running_loop().run_in_executor(
+                executor, callback, *args
+            )
+        ),
     )
     handler.write_message = lambda payload, is_bin=False: None
     handler.close = lambda *args, **kwargs: closes.append(
@@ -265,6 +271,10 @@ def _open_handler(db, key="api-key", seen_clients=None,
         f"agent:{key}".encode("utf-8")
     ).decode("ascii")
     return handler
+
+
+def _run_open(handler):
+    return asyncio.run(handler.open())
 
 
 @pytest.fixture
@@ -294,7 +304,7 @@ def test_open_schedules_downstream_writes_on_ioloop(open_handler):
         (payload, is_bin)
     )
 
-    handler.open()
+    _run_open(handler)
     handler.client.send_msg("payload", True)
 
     assert writes == []
@@ -318,7 +328,7 @@ def test_open_uses_direct_api_key_lookup_without_sync(open_handler):
     )
     handler = open_handler(db, seen_clients=seen_clients)
 
-    handler.open()
+    _run_open(handler)
 
     assert len(seen_clients) == 1
 
@@ -340,7 +350,7 @@ def test_open_syncs_local_database_once_after_api_key_miss(open_handler):
     db = SimpleNamespace(db=object(), sync=sync, get_client_by_api_key=lookup)
     handler = open_handler(db, key="fresh-key", seen_clients=seen_clients)
 
-    handler.open()
+    _run_open(handler)
 
     assert state["syncs"] == 1
     assert len(seen_clients) == 1
@@ -356,10 +366,51 @@ def test_open_never_syncs_remote_database(open_handler):
     )
     handler = open_handler(db, invalid_clients=invalid_clients)
 
-    handler.open()
+    _run_open(handler)
 
     sync.assert_not_called()
     assert len(invalid_clients) == 1
+
+
+def test_open_runs_remote_api_key_lookups_concurrently(open_handler):
+    user = _auth_user()
+
+    def lookup(key):
+        time.sleep(0.05)
+        return user
+
+    db = SimpleNamespace(
+        db=Mock(spec=AbstractRemoteDB),
+        get_client_by_api_key=lookup,
+    )
+    handlers = [open_handler(db, seen_clients=[]) for _ in range(8)]
+
+    async def run_all():
+        await asyncio.gather(*(handler.open() for handler in handlers))
+
+    started = time.monotonic()
+    asyncio.run(run_all())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+
+
+def test_open_fails_closed_when_remote_lookup_raises(open_handler):
+    closes = []
+    db = SimpleNamespace(
+        db=Mock(spec=AbstractRemoteDB),
+        get_client_by_api_key=Mock(
+            side_effect=RuntimeError("database unavailable")
+        ),
+    )
+    handler = open_handler(db, closes=closes)
+
+    _run_open(handler)
+
+    assert closes[-1]["kwargs"] == {
+        "code": 1011,
+        "reason": "client database unavailable",
+    }
 
 
 def test_open_reports_local_sync_failure_as_server_error(open_handler):
@@ -374,7 +425,7 @@ def test_open_reports_local_sync_failure_as_server_error(open_handler):
     )
     handler = open_handler(db, closes=closes)
 
-    handler.open()
+    _run_open(handler)
 
     assert closes[-1]["kwargs"] == {
         "code": 1011,
@@ -395,8 +446,8 @@ def test_open_debounces_repeated_local_sync_misses(open_handler, monkeypatch):
         get_client_by_api_key=lambda key: None,
     )
 
-    open_handler(db, key="missing-a").open()
-    open_handler(db, key="missing-b").open()
+    _run_open(open_handler(db, key="missing-a"))
+    _run_open(open_handler(db, key="missing-b"))
 
     assert state["syncs"] == 1
 
@@ -416,8 +467,8 @@ def test_open_debounces_repeated_local_sync_failures(open_handler, monkeypatch):
         get_client_by_api_key=lambda key: None,
     )
 
-    open_handler(db, closes=closes).open()
-    open_handler(db, closes=closes).open()
+    _run_open(open_handler(db, closes=closes))
+    _run_open(open_handler(db, closes=closes))
 
     assert state["syncs"] == 1
     assert [close["kwargs"]["code"] for close in closes] == [1011, 1011]

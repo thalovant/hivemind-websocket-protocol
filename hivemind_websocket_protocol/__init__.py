@@ -448,7 +448,19 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             cls._last_sync_error = None
             return refreshed
 
-    def open(self) -> None:
+    async def _lookup_client_by_api_key(self, key: str) -> Optional[Client]:
+        """Keep remote credential I/O off Tornado's single event-loop thread."""
+        database = self.hm_protocol.db
+        backend = getattr(database, "db", database)
+        if isinstance(backend, AbstractRemoteDB):
+            return await self.loop.run_in_executor(
+                None,
+                database.get_client_by_api_key,
+                key,
+            )
+        return database.get_client_by_api_key(key)
+
+    async def open(self) -> None:
         """
         Handle a new client connection and perform authorization.
         """
@@ -486,7 +498,12 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             handshake=_new_client_handshake(self.hm_protocol.identity.private_key),
         )
         self.client.source_ip = self.source_ip
-        user: Client = self.hm_protocol.db.get_client_by_api_key(key)
+        try:
+            user: Optional[Client] = await self._lookup_client_by_api_key(key)
+        except Exception:
+            LOG.exception("Client database lookup failed during websocket authorization")
+            self.close(code=1011, reason="client database unavailable")
+            return
         sync_error = False
         if not user:
             try:
