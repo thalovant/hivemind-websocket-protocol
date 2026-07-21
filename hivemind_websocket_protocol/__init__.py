@@ -106,9 +106,13 @@ def _new_client_handshake(path: Optional[str]) -> HandShake:
     return handshake
 
 
-def _new_password_handshake(password: str) -> PasswordHandShake:
+def _new_password_handshake(
+    password: str,
+    min_bits: Optional[float] = None,
+) -> PasswordHandShake:
     """Validate the credential away from Tornado's event loop."""
-    min_bits = runtime_password_min_bits()
+    if min_bits is None:
+        min_bits = runtime_password_min_bits()
     if min_bits > 0:
         # This keyed process-local fingerprint is an LRU lookup key, not a
         # stored password hash. Rotation changes the fingerprint and forces a
@@ -247,6 +251,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
         loop = ioloop.IOLoop.current()
+        password_min_bits = runtime_password_min_bits()
         auth_executor = ThreadPoolExecutor(
             max_workers=_positive_int(
                 self.config.get(
@@ -273,6 +278,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
+        HiveMindTornadoWebSocket.password_min_bits = password_min_bits
 
         if "trusted_proxy_cidrs" in self.config:
             proxy_cidrs = self.config["trusted_proxy_cidrs"]
@@ -337,6 +343,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         finally:
             HiveMindTornadoWebSocket.auth_executor = None
             HiveMindTornadoWebSocket.handshake_executor = None
+            HiveMindTornadoWebSocket.password_min_bits = None
             auth_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
         if startup_error is not None:
@@ -399,6 +406,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     hm_protocol = None
     auth_executor: Optional[ThreadPoolExecutor] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
+    password_min_bits: Optional[float] = None
     source_ip: Optional[str] = None
     _sync_lock = Lock()
     _last_sync_ts = 0.0
@@ -636,6 +644,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 self.handshake_executor,
                 _new_password_handshake,
                 user.password,
+                self.password_min_bits,
             )
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
