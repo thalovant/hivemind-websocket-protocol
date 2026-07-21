@@ -13,9 +13,9 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "tornado",
-    "hivemind-plugin-manager",
+    "hivemind-plugin-manager>=0.8.0a1,<1.0.0",
     "poorman-handshake>=2.0.0a1,<3.0.0",
-    "hivemind-core",
+    "hivemind-core>=4.10.2a2,<5.0.0",
     "pyOpenSSL",
     "pybase64",
 ]
@@ -27,7 +27,7 @@ test = [
     "hivemind-bus-client",
     "ovos-bus-client",
     "ovos-utils",
-    "hivescope",
+    "hivescope>=0.5.0a2,<1.0.0",
 ]
 
 [project.urls]
