@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.3a4](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a4) (2026-07-21)
+
+- Serialize the short password-strength validator because its temporary cache
+  lock is not thread-safe, while preserving concurrent PBKDF key derivation.
+
 ## [0.2.3a3](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a3) (2026-07-21)
 
 - Keep password-strength validation and password-key derivation off the

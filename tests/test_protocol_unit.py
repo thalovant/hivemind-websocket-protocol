@@ -243,6 +243,44 @@ def test_failed_password_strength_check_is_not_cached(monkeypatch):
     assert checks.call_count == 2
 
 
+def test_password_strength_validation_is_serialized(monkeypatch):
+    active = 0
+    maximum_active = 0
+    active_lock = threading.Lock()
+
+    def non_thread_safe_validator(password, min_bits):
+        nonlocal active, maximum_active
+        with active_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.02)
+        with active_lock:
+            active -= 1
+
+    monkeypatch.setattr(websocket_protocol, "runtime_password_min_bits", lambda: 40.0)
+    monkeypatch.setattr(
+        websocket_protocol,
+        "check_password_strength",
+        non_thread_safe_validator,
+    )
+    monkeypatch.setattr(
+        websocket_protocol,
+        "PasswordHandShake",
+        lambda password, min_bits: SimpleNamespace(password=password),
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        handshakes = list(
+            executor.map(
+                _new_password_handshake,
+                [f"strong-machine-secret-{index}" for index in range(8)],
+            )
+        )
+
+    assert maximum_active == 1
+    assert len(handshakes) == 8
+
+
 # --- websocket ping settings -----------------------------------------------
 
 def test_websocket_ping_settings_default(monkeypatch):
