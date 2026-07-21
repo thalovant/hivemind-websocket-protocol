@@ -543,13 +543,15 @@ def test_open_keeps_password_validation_off_event_loop(open_handler, monkeypatch
     user = _auth_user()
     user.password = "strong-machine-secret"
 
-    def build_handshake(password):
+    def build_handshake(password, min_bits):
         time.sleep(0.05)
-        return SimpleNamespace(password=password)
+        return SimpleNamespace(password=password, min_bits=min_bits)
 
     monkeypatch.setattr(websocket_protocol, "_new_password_handshake", build_handshake)
     db = SimpleNamespace(get_client_by_api_key=lambda key: user)
     handlers = [open_handler(db, seen_clients=[]) for _ in range(8)]
+    for handler in handlers:
+        handler.password_min_bits = 40.0
 
     async def run_all():
         await asyncio.gather(*(handler.open() for handler in handlers))
@@ -560,6 +562,7 @@ def test_open_keeps_password_validation_off_event_loop(open_handler, monkeypatch
 
     assert elapsed < 0.25
     assert all(handler.client.pswd_handshake.password == user.password for handler in handlers)
+    assert all(handler.client.pswd_handshake.min_bits == 40.0 for handler in handlers)
 
 
 def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeypatch):
@@ -575,6 +578,7 @@ def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeyp
     handler = open_handler(db, seen_clients=[])
     handler.auth_executor = auth_executor
     handler.handshake_executor = handshake_executor
+    handler.password_min_bits = 40.0
 
     async def run_in_executor(executor, callback, *args):
         calls.append((executor, callback))
@@ -587,7 +591,10 @@ def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeyp
     monkeypatch.setattr(
         websocket_protocol,
         "_new_password_handshake",
-        lambda password: SimpleNamespace(password=password),
+        lambda password, min_bits: SimpleNamespace(
+            password=password,
+            min_bits=min_bits,
+        ),
     )
 
     _run_open(handler)
@@ -597,6 +604,27 @@ def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeyp
         (handshake_executor, websocket_protocol._new_password_handshake),
         (auth_executor, handler.hm_protocol.handle_new_client),
     ]
+
+
+def test_open_uses_startup_password_policy_snapshot(open_handler, monkeypatch):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    handler.password_min_bits = 0.0
+    monkeypatch.setattr(
+        websocket_protocol,
+        "runtime_password_min_bits",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("connection hot path re-read server config")
+        ),
+    )
+
+    _run_open(handler)
+
+    assert handler.client.pswd_handshake.password == user.password
 
 
 def test_executor_worker_defaults_cover_guarded_admission_burst():
