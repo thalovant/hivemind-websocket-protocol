@@ -2,11 +2,13 @@ import asyncio
 import binascii
 import copy
 import dataclasses
+import hashlib
 import math
 import os
 import os.path
 import random
 import time
+from collections import OrderedDict
 from os import makedirs
 from os.path import exists, join
 from threading import Lock
@@ -61,6 +63,11 @@ _HANDSHAKE_TEMPLATE_CACHE: Dict[
 ] = {}
 _HANDSHAKE_TEMPLATE_LOCK = Lock()
 _PASSWORD_STRENGTH_LOCK = Lock()
+_PASSWORD_STRENGTH_CACHE: "OrderedDict[Tuple[bytes, float], None]" = OrderedDict()
+_PASSWORD_STRENGTH_CACHE_KEY = os.urandom(32)
+_PASSWORD_STRENGTH_CACHE_SIZE = 4096
+
+
 def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
     """Return a cheap rotation-aware fingerprint for a listener private key."""
     if not path or not os.path.isfile(path):
@@ -100,11 +107,21 @@ def _new_password_handshake(password: str) -> PasswordHandShake:
     """Validate the credential away from Tornado's event loop."""
     min_bits = runtime_password_min_bits()
     if min_bits > 0:
-        # zxcvbn's cache-backed validator is not thread-safe. Keep this short
-        # validation serialized while the much heavier PBKDF handshake stays
-        # concurrent in the executor.
+        # This keyed process-local fingerprint is an LRU lookup key, not a
+        # stored password hash. Rotation changes the fingerprint and forces a
+        # fresh validation; the random key is never persisted.
+        digest = hashlib.blake2s(
+            password.encode("utf-8"),
+            key=_PASSWORD_STRENGTH_CACHE_KEY,
+        ).digest()  # lgtm[py/weak-sensitive-data-hashing]
+        cache_key = (digest, min_bits)
         with _PASSWORD_STRENGTH_LOCK:
-            check_password_strength(password, min_bits=min_bits)
+            if cache_key not in _PASSWORD_STRENGTH_CACHE:
+                check_password_strength(password, min_bits=min_bits)
+                _PASSWORD_STRENGTH_CACHE[cache_key] = None
+                while len(_PASSWORD_STRENGTH_CACHE) > _PASSWORD_STRENGTH_CACHE_SIZE:
+                    _PASSWORD_STRENGTH_CACHE.popitem(last=False)
+            _PASSWORD_STRENGTH_CACHE.move_to_end(cache_key)
     return PasswordHandShake(password, min_bits=0)
 
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.3a6](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a6) (2026-07-21)
+
+- Cache successful strength validation by a bounded, process-keyed credential
+  fingerprint so reconnects skip repeated zxcvbn work while rotations force a
+  fresh check.
+
 ## [0.2.3a5](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a5) (2026-07-21)
 
 - Redact WebSocket query strings from Tornado request summaries so uncaught

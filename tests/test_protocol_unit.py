@@ -25,6 +25,7 @@ from hivemind_websocket_protocol import (
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
     _HANDSHAKE_TEMPLATE_CACHE,
+    _PASSWORD_STRENGTH_CACHE,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
     _finish_websocket_write,
@@ -41,7 +42,9 @@ from hivescope.node import MasterNode
 def _reset_websocket_sync_state():
     HiveMindTornadoWebSocket._last_sync_ts = 0.0
     HiveMindTornadoWebSocket._last_sync_error = None
+    _PASSWORD_STRENGTH_CACHE.clear()
     yield
+    _PASSWORD_STRENGTH_CACHE.clear()
 
 
 # --- version.py module load ------------------------------------------------
@@ -219,7 +222,7 @@ def test_client_handshake_does_not_cache_missing_key(fake_handshake, tmp_path):
 
 # --- password-strength validation -----------------------------------------
 
-def test_password_strength_is_checked_for_each_connection(monkeypatch):
+def test_password_strength_is_checked_once_per_credential_revision(monkeypatch):
     checks = Mock()
     constructor_bits = []
 
@@ -238,13 +241,13 @@ def test_password_strength_is_checked_for_each_connection(monkeypatch):
 
     assert first is not second
     assert rotated.password.endswith("v2")
-    assert checks.call_count == 3
+    assert checks.call_count == 2
     checks.assert_has_calls([
-        call("strong-machine-secret-v1", min_bits=40.0),
         call("strong-machine-secret-v1", min_bits=40.0),
         call("strong-machine-secret-v2", min_bits=40.0),
     ])
     assert constructor_bits == [0, 0, 0]
+    assert all("strong-machine-secret" not in repr(key) for key in _PASSWORD_STRENGTH_CACHE)
 
 
 def test_failed_password_strength_check_is_not_cached(monkeypatch):
