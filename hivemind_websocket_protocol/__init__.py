@@ -654,7 +654,19 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self.close()
             return
 
-        self.hm_protocol.handle_new_client(self.client)
+        try:
+            # Admission callbacks publish the initial runtime-bus presence and
+            # handshake frames. Keep that synchronous I/O off Tornado's event
+            # loop so one slow callback cannot serialize a connection burst.
+            await self.loop.run_in_executor(
+                self.auth_executor,
+                self.hm_protocol.handle_new_client,
+                self.client,
+            )
+        except Exception:
+            LOG.exception("Client admission callback failed")
+            self.close(code=1011, reason="client admission unavailable")
+            return
         # self.write_message(Message("connected").serialize())
 
     def on_close(self):

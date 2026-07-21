@@ -595,12 +595,42 @@ def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeyp
     assert calls == [
         (auth_executor, db.get_client_by_api_key),
         (handshake_executor, websocket_protocol._new_password_handshake),
+        (auth_executor, handler.hm_protocol.handle_new_client),
     ]
 
 
 def test_executor_worker_defaults_cover_guarded_admission_burst():
     assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
     assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
+
+
+def test_open_runs_admission_callbacks_concurrently(open_handler):
+    user = _auth_user()
+    seen_clients = []
+
+    def slow_admission(client):
+        time.sleep(0.05)
+        seen_clients.append(client)
+
+    handlers = [
+        open_handler(
+            SimpleNamespace(get_client_by_api_key=lambda key: user),
+            seen_clients=[],
+        )
+        for _ in range(8)
+    ]
+    for handler in handlers:
+        handler.hm_protocol.handle_new_client = slow_admission
+
+    async def run_all():
+        await asyncio.gather(*(handler.open() for handler in handlers))
+
+    started = time.monotonic()
+    asyncio.run(run_all())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert len(seen_clients) == 8
 
 
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):
