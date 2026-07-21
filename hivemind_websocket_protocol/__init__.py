@@ -9,6 +9,7 @@ import os.path
 import random
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from os import makedirs
 from os.path import exists, join
 from threading import Lock
@@ -55,6 +56,8 @@ from hivemind_websocket_protocol._client_ip import (
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
+DEFAULT_AUTH_EXECUTOR_WORKERS = 64
+DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
 
 
 _HANDSHAKE_TEMPLATE_CACHE: Dict[
@@ -191,6 +194,20 @@ def _non_negative_float(value: Any, default: float, name: str) -> float:
     return parsed
 
 
+def _positive_int(value: Any, default: int, name: str) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        LOG.warning(f"Ignoring invalid {name}: {value!r}")
+        return default
+    if parsed < 1:
+        LOG.warning(f"Ignoring non-positive {name}: {value!r}")
+        return default
+    return parsed
+
+
 @dataclasses.dataclass
 class HiveMindWebsocketProtocol(NetworkProtocol):
     """
@@ -230,8 +247,32 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
         loop = ioloop.IOLoop.current()
+        auth_executor = ThreadPoolExecutor(
+            max_workers=_positive_int(
+                self.config.get(
+                    "auth_executor_workers",
+                    os.getenv("HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS"),
+                ),
+                DEFAULT_AUTH_EXECUTOR_WORKERS,
+                "auth_executor_workers",
+            ),
+            thread_name_prefix="hivemind-wss-auth",
+        )
+        handshake_executor = ThreadPoolExecutor(
+            max_workers=_positive_int(
+                self.config.get(
+                    "handshake_executor_workers",
+                    os.getenv("HIVEMIND_WEBSOCKET_HANDSHAKE_EXECUTOR_WORKERS"),
+                ),
+                DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
+                "handshake_executor_workers",
+            ),
+            thread_name_prefix="hivemind-wss-handshake",
+        )
         HiveMindTornadoWebSocket.loop = loop
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
+        HiveMindTornadoWebSocket.auth_executor = auth_executor
+        HiveMindTornadoWebSocket.handshake_executor = handshake_executor
 
         if "trusted_proxy_cidrs" in self.config:
             proxy_cidrs = self.config["trusted_proxy_cidrs"]
@@ -291,7 +332,13 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                 loop.stop()
 
         loop.add_callback(start_listener)
-        loop.start()  # blocking
+        try:
+            loop.start()  # blocking
+        finally:
+            HiveMindTornadoWebSocket.auth_executor = None
+            HiveMindTornadoWebSocket.handshake_executor = None
+            auth_executor.shutdown(wait=True, cancel_futures=True)
+            handshake_executor.shutdown(wait=True, cancel_futures=True)
         if startup_error is not None:
             raise startup_error
 
@@ -350,6 +397,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         hm_protocol (Optional[HiveMindListenerProtocol]): The protocol instance for handling HiveMind messages.
     """
     hm_protocol = None
+    auth_executor: Optional[ThreadPoolExecutor] = None
+    handshake_executor: Optional[ThreadPoolExecutor] = None
     source_ip: Optional[str] = None
     _sync_lock = Lock()
     _last_sync_ts = 0.0
@@ -451,7 +500,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             # Password-key derivation uses PBKDF2 and must not serialize every
             # concurrent connection on Tornado's single event-loop thread.
             await self.loop.run_in_executor(
-                None,
+                self.handshake_executor,
                 self.hm_protocol.handle_message,
                 message,
                 self.client,
@@ -499,7 +548,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         backend = getattr(database, "db", database)
         if isinstance(backend, AbstractRemoteDB):
             return await self.loop.run_in_executor(
-                None,
+                self.auth_executor,
                 database.get_client_by_api_key,
                 key,
             )
@@ -584,7 +633,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         if user.password:
             # pre-shared password to derive aes_key
             self.client.pswd_handshake = await self.loop.run_in_executor(
-                None,
+                self.handshake_executor,
                 _new_password_handshake,
                 user.password,
             )
@@ -605,7 +654,19 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self.close()
             return
 
-        self.hm_protocol.handle_new_client(self.client)
+        try:
+            # Admission callbacks publish the initial runtime-bus presence and
+            # handshake frames. Keep that synchronous I/O off Tornado's event
+            # loop so one slow callback cannot serialize a connection burst.
+            await self.loop.run_in_executor(
+                self.auth_executor,
+                self.hm_protocol.handle_new_client,
+                self.client,
+            )
+        except Exception:
+            LOG.exception("Client admission callback failed")
+            self.close(code=1011, reason="client admission unavailable")
+            return
         # self.write_message(Message("connected").serialize())
 
     def on_close(self):
