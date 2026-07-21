@@ -2,7 +2,7 @@ import asyncio
 import binascii
 import copy
 import dataclasses
-import hmac
+import hashlib
 import math
 import os
 import os.path
@@ -110,11 +110,10 @@ def _new_password_handshake(password: str) -> PasswordHandShake:
         # This keyed process-local fingerprint is an LRU lookup key, not a
         # stored password hash. Rotation changes the fingerprint and forces a
         # fresh validation; the random key is never persisted.
-        digest = hmac.digest(  # lgtm[py/weak-sensitive-data-hashing]
-            _PASSWORD_STRENGTH_CACHE_KEY,
+        digest = hashlib.blake2s(
             password.encode("utf-8"),
-            "sha256",
-        )
+            key=_PASSWORD_STRENGTH_CACHE_KEY,
+        ).digest()
         cache_key = (digest, min_bits)
         with _PASSWORD_STRENGTH_LOCK:
             if cache_key not in _PASSWORD_STRENGTH_CACHE:
