@@ -140,6 +140,22 @@ def test_password_handshakes_are_processed_concurrently_off_event_loop():
     assert len(handled) == 8
 
 
+def test_request_summary_redacts_authorization_query():
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.request = SimpleNamespace(
+        method="GET",
+        path="/",
+        uri="/?authorization=encoded-disposable-secret",
+        remote_ip="203.0.113.10",
+    )
+
+    summary = handler._request_summary()
+
+    assert summary == "GET / (203.0.113.10)"
+    assert "authorization" not in summary
+    assert "encoded-disposable-secret" not in summary
+
+
 # --- listener handshake key cache -----------------------------------------
 
 class _FakeHandshake:
