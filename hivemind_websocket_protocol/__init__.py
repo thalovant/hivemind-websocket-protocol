@@ -113,7 +113,7 @@ def _new_password_handshake(password: str) -> PasswordHandShake:
         digest = hashlib.blake2s(
             password.encode("utf-8"),
             key=_PASSWORD_STRENGTH_CACHE_KEY,
-        ).digest()
+        ).digest()  # lgtm[py/weak-sensitive-data-hashing]
         cache_key = (digest, min_bits)
         with _PASSWORD_STRENGTH_LOCK:
             if cache_key not in _PASSWORD_STRENGTH_CACHE:
