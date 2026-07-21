@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3a3](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a3) (2026-07-21)
+
+- Keep password-strength validation and password-key derivation off the
+  Tornado event loop.
+- Preserve isolated per-connection password-handshake state while retaining
+  strength validation for every connection.
+
 ## [0.2.3a2](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a2) (2026-07-16)
 
 [Full Changelog](https://github.com/thalovant/hivemind-websocket-protocol/compare/0.2.3a1...0.2.3a2)
