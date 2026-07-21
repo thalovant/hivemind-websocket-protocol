@@ -60,6 +60,7 @@ _HANDSHAKE_TEMPLATE_CACHE: Dict[
     Tuple[Tuple[str, int, int, int, int], HandShake],
 ] = {}
 _HANDSHAKE_TEMPLATE_LOCK = Lock()
+_PASSWORD_STRENGTH_LOCK = Lock()
 def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
     """Return a cheap rotation-aware fingerprint for a listener private key."""
     if not path or not os.path.isfile(path):
@@ -99,7 +100,11 @@ def _new_password_handshake(password: str) -> PasswordHandShake:
     """Validate the credential away from Tornado's event loop."""
     min_bits = runtime_password_min_bits()
     if min_bits > 0:
-        check_password_strength(password, min_bits=min_bits)
+        # zxcvbn's cache-backed validator is not thread-safe. Keep this short
+        # validation serialized while the much heavier PBKDF handshake stays
+        # concurrent in the executor.
+        with _PASSWORD_STRENGTH_LOCK:
+            check_password_strength(password, min_bits=min_bits)
     return PasswordHandShake(password, min_bits=0)
 
 
