@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.3a5](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a5) (2026-07-21)
+
+- Redact WebSocket query strings from Tornado request summaries so uncaught
+  exception logs cannot expose encoded authorization credentials.
+
 ## [0.2.3a4](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a4) (2026-07-21)
 
 - Serialize the short password-strength validator because its temporary cache

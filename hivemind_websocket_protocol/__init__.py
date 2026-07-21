@@ -445,6 +445,13 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     def _peer_label(self, peer: str) -> str:
         return f"{peer} ({self.source_ip})" if self.source_ip else peer
 
+    def _request_summary(self) -> str:
+        """Keep query-string credentials out of Tornado request logs."""
+        return (
+            f"{self.request.method} {self.request.path} "
+            f"({self.request.remote_ip})"
+        )
+
     @classmethod
     def _sync_client_database(cls, database: Any) -> bool:
         """Debounce local database reloads after an API-key cache miss."""
