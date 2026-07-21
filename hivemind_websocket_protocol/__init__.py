@@ -19,7 +19,7 @@ from hivemind_plugin_manager.protocols import NetworkProtocol
 from ovos_bus_client.session import Session
 from ovos_utils.log import LOG
 from ovos_utils.xdg_utils import xdg_data_home
-from poorman_handshake import HandShake, PasswordHandShake
+from poorman_handshake import HandShake, PasswordHandShake, check_password_strength
 from tornado import ioloop
 from tornado import web
 from tornado.iostream import StreamClosedError
@@ -60,8 +60,6 @@ _HANDSHAKE_TEMPLATE_CACHE: Dict[
     Tuple[Tuple[str, int, int, int, int], HandShake],
 ] = {}
 _HANDSHAKE_TEMPLATE_LOCK = Lock()
-
-
 def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
     """Return a cheap rotation-aware fingerprint for a listener private key."""
     if not path or not os.path.isfile(path):
@@ -95,6 +93,14 @@ def _new_client_handshake(path: Optional[str]) -> HandShake:
     handshake.target_key = None
     handshake.secret = None
     return handshake
+
+
+def _new_password_handshake(password: str) -> PasswordHandShake:
+    """Validate the credential away from Tornado's event loop."""
+    min_bits = runtime_password_min_bits()
+    if min_bits > 0:
+        check_password_strength(password, min_bits=min_bits)
+    return PasswordHandShake(password, min_bits=0)
 
 
 def _refresh_local_client_database(database: Any) -> bool:
@@ -406,7 +412,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             raise ValueError("invalid authorization payload")
         return name, key
 
-    def on_message(self, message: str) -> None:
+    async def on_message(self, message: str) -> None:
         message = self.client.decode(message)
         if message.msg_type == HiveMessageType.HELLO:
             self._remember_hello_session(message)
@@ -419,7 +425,17 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             LOG.debug(f"Received {peer} sent base64 audio for STT")
         else:
             LOG.debug(f"Received {peer} message: {message}")
-        self.hm_protocol.handle_message(message, self.client)
+        if message.msg_type == HiveMessageType.HANDSHAKE:
+            # Password-key derivation uses PBKDF2 and must not serialize every
+            # concurrent connection on Tornado's single event-loop thread.
+            await self.loop.run_in_executor(
+                None,
+                self.hm_protocol.handle_message,
+                message,
+                self.client,
+            )
+        else:
+            self.hm_protocol.handle_message(message, self.client)
 
     def _peer_label(self, peer: str) -> str:
         return f"{peer} ({self.source_ip})" if self.source_ip else peer
@@ -538,7 +554,11 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.is_admin = user.is_admin
         if user.password:
             # pre-shared password to derive aes_key
-            self.client.pswd_handshake = PasswordHandShake(user.password, min_bits=runtime_password_min_bits())
+            self.client.pswd_handshake = await self.loop.run_in_executor(
+                None,
+                _new_password_handshake,
+                user.password,
+            )
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
 

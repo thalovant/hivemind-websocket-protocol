@@ -14,7 +14,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pybase64
 import pytest
@@ -29,6 +29,7 @@ from hivemind_websocket_protocol import (
     HiveMindWebsocketProtocol,
     _finish_websocket_write,
     _new_client_handshake,
+    _new_password_handshake,
     _refresh_local_client_database,
     _write_websocket_message,
 )
@@ -40,6 +41,7 @@ from hivescope.node import MasterNode
 def _reset_websocket_sync_state():
     HiveMindTornadoWebSocket._last_sync_ts = 0.0
     HiveMindTornadoWebSocket._last_sync_error = None
+    yield
 
 
 # --- version.py module load ------------------------------------------------
@@ -95,6 +97,47 @@ def test_synchronous_closed_websocket_write_is_routine():
     _write_websocket_message(handler, "payload", False)
 
     handler.write_message.assert_called_once_with("payload", False)
+
+
+def test_password_handshakes_are_processed_concurrently_off_event_loop():
+    handled = []
+
+    def slow_handshake(message, client):
+        time.sleep(0.05)
+        handled.append(client.peer)
+
+    handlers = []
+    for index in range(8):
+        handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+        message = SimpleNamespace(
+            msg_type=websocket_protocol.HiveMessageType.HANDSHAKE,
+            payload={},
+        )
+        handler.client = SimpleNamespace(
+            peer=f"client-{index}",
+            decode=lambda payload, decoded=message: decoded,
+        )
+        handler.hm_protocol = SimpleNamespace(handle_message=slow_handshake)
+        handler.loop = SimpleNamespace(
+            run_in_executor=lambda executor, callback, *args: (
+                asyncio.get_running_loop().run_in_executor(
+                    executor,
+                    callback,
+                    *args,
+                )
+            ),
+        )
+        handlers.append(handler)
+
+    async def run_all():
+        await asyncio.gather(*(handler.on_message("payload") for handler in handlers))
+
+    started = time.monotonic()
+    asyncio.run(run_all())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert len(handled) == 8
 
 
 # --- listener handshake key cache -----------------------------------------
@@ -156,6 +199,48 @@ def test_client_handshake_does_not_cache_missing_key(fake_handshake, tmp_path):
 
     assert fake_handshake.created == 2
     assert first.private_key is not second.private_key
+
+
+# --- password-strength validation -----------------------------------------
+
+def test_password_strength_is_checked_for_each_connection(monkeypatch):
+    checks = Mock()
+    constructor_bits = []
+
+    class FakePasswordHandshake:
+        def __init__(self, password, min_bits):
+            self.password = password
+            constructor_bits.append(min_bits)
+
+    monkeypatch.setattr(websocket_protocol, "runtime_password_min_bits", lambda: 40.0)
+    monkeypatch.setattr(websocket_protocol, "check_password_strength", checks)
+    monkeypatch.setattr(websocket_protocol, "PasswordHandShake", FakePasswordHandshake)
+
+    first = _new_password_handshake("strong-machine-secret-v1")
+    second = _new_password_handshake("strong-machine-secret-v1")
+    rotated = _new_password_handshake("strong-machine-secret-v2")
+
+    assert first is not second
+    assert rotated.password.endswith("v2")
+    assert checks.call_count == 3
+    checks.assert_has_calls([
+        call("strong-machine-secret-v1", min_bits=40.0),
+        call("strong-machine-secret-v1", min_bits=40.0),
+        call("strong-machine-secret-v2", min_bits=40.0),
+    ])
+    assert constructor_bits == [0, 0, 0]
+
+
+def test_failed_password_strength_check_is_not_cached(monkeypatch):
+    checks = Mock(side_effect=ValueError("weak"))
+    monkeypatch.setattr(websocket_protocol, "runtime_password_min_bits", lambda: 40.0)
+    monkeypatch.setattr(websocket_protocol, "check_password_strength", checks)
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="weak"):
+            _new_password_handshake("weak")
+
+    assert checks.call_count == 2
 
 
 # --- websocket ping settings -----------------------------------------------
@@ -393,6 +478,29 @@ def test_open_runs_remote_api_key_lookups_concurrently(open_handler):
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.25
+
+
+def test_open_keeps_password_validation_off_event_loop(open_handler, monkeypatch):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+
+    def build_handshake(password):
+        time.sleep(0.05)
+        return SimpleNamespace(password=password)
+
+    monkeypatch.setattr(websocket_protocol, "_new_password_handshake", build_handshake)
+    db = SimpleNamespace(get_client_by_api_key=lambda key: user)
+    handlers = [open_handler(db, seen_clients=[]) for _ in range(8)]
+
+    async def run_all():
+        await asyncio.gather(*(handler.open() for handler in handlers))
+
+    started = time.monotonic()
+    asyncio.run(run_all())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    assert all(handler.client.pswd_handshake.password == user.password for handler in handlers)
 
 
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):
