@@ -23,6 +23,7 @@ from tornado.websocket import WebSocketClosedError
 
 from hivemind_websocket_protocol import (
     DEFAULT_AUTH_EXECUTOR_WORKERS,
+    DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS,
     DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
     DEFAULT_PREFER_PRESHARED_KEY,
@@ -705,6 +706,7 @@ def test_open_uses_startup_password_policy_snapshot(open_handler, monkeypatch):
 def test_executor_worker_defaults_cover_guarded_admission_burst():
     assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
     assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
+    assert DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS >= 8
     assert DEFAULT_DISCONNECT_EXECUTOR_WORKERS == 1
 
 
@@ -735,6 +737,94 @@ def test_open_runs_admission_callbacks_concurrently(open_handler):
 
     assert elapsed < 0.25
     assert len(seen_clients) == 8
+
+
+def test_open_returns_before_blocking_connect_lifecycle(open_handler):
+    user = _auth_user()
+    lifecycle_started = threading.Event()
+    release_lifecycle = threading.Event()
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    protocol_clients = []
+    lifecycle_clients = []
+
+    def initialize_protocol(client):
+        protocol_clients.append(client)
+        return True
+
+    def publish_lifecycle(client):
+        lifecycle_started.set()
+        release_lifecycle.wait(1)
+        lifecycle_clients.append(client)
+
+    handler.hm_protocol.handle_new_client_protocol = initialize_protocol
+    handler.hm_protocol.handle_client_connected = publish_lifecycle
+    lifecycle_executor = ThreadPoolExecutor(max_workers=1)
+    handler.connect_lifecycle_executor = lifecycle_executor
+
+    try:
+        started = time.monotonic()
+        _run_open(handler)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.25
+        assert lifecycle_started.wait(1)
+        assert protocol_clients == [handler.client]
+        assert lifecycle_clients == []
+    finally:
+        release_lifecycle.set()
+        lifecycle_executor.shutdown(wait=True)
+
+    assert lifecycle_clients == [handler.client]
+
+
+def test_close_waits_for_matching_connect_lifecycle(open_handler):
+    user = _auth_user()
+    lifecycle_started = threading.Event()
+    release_lifecycle = threading.Event()
+    disconnect_finished = threading.Event()
+    events = []
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+
+    handler.hm_protocol.handle_new_client_protocol = lambda _client: True
+
+    def publish_lifecycle(_client):
+        events.append("connect-start")
+        lifecycle_started.set()
+        release_lifecycle.wait(1)
+        events.append("connect-finish")
+
+    def publish_disconnect(_client):
+        events.append("disconnect")
+        disconnect_finished.set()
+
+    handler.hm_protocol.handle_client_connected = publish_lifecycle
+    handler.hm_protocol.handle_client_disconnected = publish_disconnect
+    lifecycle_executor = ThreadPoolExecutor(max_workers=1)
+    disconnect_executor = ThreadPoolExecutor(max_workers=1)
+    handler.connect_lifecycle_executor = lifecycle_executor
+    handler.disconnect_executor = disconnect_executor
+
+    try:
+        _run_open(handler)
+        assert lifecycle_started.wait(1)
+
+        handler.on_close()
+        handler.on_close()
+        assert not disconnect_finished.wait(0.05)
+        release_lifecycle.set()
+        assert disconnect_finished.wait(1)
+    finally:
+        release_lifecycle.set()
+        lifecycle_executor.shutdown(wait=True)
+        disconnect_executor.shutdown(wait=True)
+
+    assert events == ["connect-start", "connect-finish", "disconnect"]
 
 
 def test_close_defers_ordered_disconnect_callbacks_off_event_loop():
