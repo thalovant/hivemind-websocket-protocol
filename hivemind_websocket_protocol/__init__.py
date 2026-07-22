@@ -755,7 +755,10 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         LOG.debug(f"disconnecting client: {self._peer_label(client.peer)}")
         executor = self.disconnect_executor
         if executor is None:
-            LOG.warning("HiveMind websocket disconnect executor is unavailable")
+            # Embedded/test harnesses may install the handler without starting
+            # HiveMindWebsocketProtocol.run(), which owns the executor. Retain
+            # the historical synchronous behavior for those integrations.
+            self.hm_protocol.handle_client_disconnected(client)
             return
         try:
             future = executor.submit(

@@ -109,6 +109,9 @@ export HIVEMIND_TRUSTED_CLIENT_IP_HEADERS="x-forwarded-for"
 | `trusted_client_ip_headers` | `HIVEMIND_TRUSTED_CLIENT_IP_HEADERS` | `x-hivemind-client-ip,x-forwarded-for,x-real-ip` | Ordered list of headers to inspect for real client IP. |
 | `websocket_ping_interval` | `HIVEMIND_WEBSOCKET_PING_INTERVAL` | `30.0` | Seconds between WebSocket ping frames. |
 | `websocket_ping_timeout` | `HIVEMIND_WEBSOCKET_PING_TIMEOUT` | `20.0` | Seconds to wait for pong before closing the connection. |
+| `auth_executor_workers` | `HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS` | `64` | Workers for remote authorization and admission callbacks. |
+| `handshake_executor_workers` | `HIVEMIND_WEBSOCKET_HANDSHAKE_EXECUTOR_WORKERS` | `32` | Workers for password and protocol handshake work. |
+| `disconnect_executor_workers` | `HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS` | `1` | Ordered workers for disconnect lifecycle callbacks. |
 | `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `false` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. |
 
 Both `trusted_proxy_cidrs` and `trusted_client_ip_headers` accept a string, list, or

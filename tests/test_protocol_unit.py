@@ -777,6 +777,22 @@ def test_close_defers_ordered_disconnect_callbacks_off_event_loop():
     ]
 
 
+def test_close_retains_embedded_handler_fallback_without_executor():
+    disconnected = []
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.hm_protocol = SimpleNamespace(
+        handle_client_disconnected=disconnected.append,
+    )
+    handler.disconnect_executor = None
+    handler.client = SimpleNamespace(peer="embedded")
+    handler.source_ip = "127.0.0.1"
+    handler.request = SimpleNamespace(remote_ip="127.0.0.1")
+
+    handler.on_close()
+
+    assert disconnected == [handler.client]
+
+
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):
     closes = []
     db = SimpleNamespace(

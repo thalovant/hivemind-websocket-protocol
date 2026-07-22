@@ -42,7 +42,10 @@ Decodes the raw WebSocket frame via `client.decode()`, then dispatches to
 ### `on_close()`
 
 Guards against connections that never completed `open()` (where `self.client`
-was never set), then calls `hm_protocol.handle_client_disconnected(client)`.
+was never set), then submits `hm_protocol.handle_client_disconnected(client)`
+to an ordered disconnect executor. Runtime-bus disconnect notifications can
+perform synchronous I/O, so they must not run on Tornado's event-loop thread or
+delay unrelated handshakes.
 
 ## Authorization
 
