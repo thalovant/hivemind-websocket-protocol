@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3a10](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a10) (2026-07-22)
+
+- Retain the password-handshake compatibility advertisement when pre-shared
+  keys are preferred so protocol-floor enforcement continues to admit clients.
+- Skip only the redundant, serialized password-strength analysis for clients
+  that already have a high-entropy crypto key.
+
 ## [0.2.3a9](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a9) (2026-07-22)
 
 - Add an opt-in pre-shared-key preference that avoids constructing an unused,

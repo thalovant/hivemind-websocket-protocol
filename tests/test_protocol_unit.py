@@ -566,12 +566,13 @@ def test_open_keeps_password_validation_off_event_loop(open_handler, monkeypatch
     assert all(handler.client.pswd_handshake.min_bits == 40.0 for handler in handlers)
 
 
-def test_open_skips_password_handshake_when_preshared_key_is_preferred(
+def test_open_skips_password_strength_check_when_preshared_key_is_preferred(
         open_handler, monkeypatch):
     user = _auth_user()
     user.password = "strong-machine-secret"
     user.crypto_key = "0123456789abcdef"
-    build_handshake = Mock()
+    password_handshake = SimpleNamespace(password=user.password)
+    build_handshake = Mock(return_value=password_handshake)
     monkeypatch.setattr(
         websocket_protocol,
         "_new_password_handshake",
@@ -586,8 +587,8 @@ def test_open_skips_password_handshake_when_preshared_key_is_preferred(
     _run_open(handler)
 
     assert handler.client.crypto_key == user.crypto_key
-    assert handler.client.pswd_handshake is None
-    build_handshake.assert_not_called()
+    assert handler.client.pswd_handshake is password_handshake
+    build_handshake.assert_called_once_with(user.password, 0.0)
 
 
 def test_open_keeps_password_handshake_without_preshared_key(
@@ -610,7 +611,7 @@ def test_open_keeps_password_handshake_without_preshared_key(
 
     _run_open(handler)
 
-    build_handshake.assert_called_once()
+    build_handshake.assert_called_once_with(user.password, None)
     assert handler.client.pswd_handshake.password == user.password
 
 
