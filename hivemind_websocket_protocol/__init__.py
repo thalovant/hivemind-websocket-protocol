@@ -60,6 +60,7 @@ DEFAULT_AUTH_EXECUTOR_WORKERS = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
 DEFAULT_PREFER_PRESHARED_KEY = False
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
+DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS = 16
 
 
 _HANDSHAKE_TEMPLATE_CACHE: Dict[
@@ -172,6 +173,25 @@ def _finish_disconnect_callback(future: Any) -> None:
             "HiveMind websocket disconnect callback failed: "
             f"{type(error).__name__}: {error!r}"
         )
+
+
+def _finish_connect_lifecycle(
+        handler: "HiveMindTornadoWebSocket", future: Any) -> None:
+    """Observe deferred connect lifecycle failures and close fail-closed."""
+    if future.cancelled():
+        return
+    error = future.exception()
+    if error is None:
+        return
+    LOG.error(
+        "HiveMind websocket connect lifecycle failed: "
+        f"{type(error).__name__}: {error!r}"
+    )
+    handler.loop.add_callback(
+        handler.close,
+        1011,
+        "client lifecycle unavailable",
+    )
 
 
 def _write_websocket_message(handler: WebSocketHandler,
@@ -323,11 +343,27 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             ),
             thread_name_prefix="hivemind-wss-disconnect",
         )
+        connect_lifecycle_executor = ThreadPoolExecutor(
+            max_workers=_positive_int(
+                self.config.get(
+                    "connect_lifecycle_executor_workers",
+                    os.getenv(
+                        "HIVEMIND_WEBSOCKET_CONNECT_LIFECYCLE_EXECUTOR_WORKERS"
+                    ),
+                ),
+                DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS,
+                "connect_lifecycle_executor_workers",
+            ),
+            thread_name_prefix="hivemind-wss-connect-lifecycle",
+        )
         HiveMindTornadoWebSocket.loop = loop
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
         HiveMindTornadoWebSocket.disconnect_executor = disconnect_executor
+        HiveMindTornadoWebSocket.connect_lifecycle_executor = (
+            connect_lifecycle_executor
+        )
         HiveMindTornadoWebSocket.password_min_bits = password_min_bits
         HiveMindTornadoWebSocket.prefer_preshared_key = (
             self._prefer_preshared_key()
@@ -397,9 +433,14 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             HiveMindTornadoWebSocket.auth_executor = None
             HiveMindTornadoWebSocket.handshake_executor = None
             HiveMindTornadoWebSocket.disconnect_executor = None
+            HiveMindTornadoWebSocket.connect_lifecycle_executor = None
             HiveMindTornadoWebSocket.password_min_bits = None
             auth_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
+            connect_lifecycle_executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+            )
             disconnect_executor.shutdown(wait=True, cancel_futures=True)
         if startup_error is not None:
             raise startup_error
@@ -462,6 +503,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     auth_executor: Optional[ThreadPoolExecutor] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
     disconnect_executor: Optional[ThreadPoolExecutor] = None
+    connect_lifecycle_executor: Optional[ThreadPoolExecutor] = None
     password_min_bits: Optional[float] = None
     prefer_preshared_key: bool = DEFAULT_PREFER_PRESHARED_KEY
     source_ip: Optional[str] = None
@@ -469,6 +511,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     _last_sync_ts = 0.0
     _last_sync_error: Optional[Exception] = None
     _sync_debounce_s = 1.0
+    _connect_lifecycle_future: Optional[Any] = None
+    _disconnect_submitted: bool = False
 
     @staticmethod
     def _serialized_session(session: Any) -> dict[str, Any]:
@@ -729,19 +773,59 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self.close()
             return
 
-        try:
-            # Admission callbacks publish the initial runtime-bus presence and
-            # handshake frames. Keep that synchronous I/O off Tornado's event
-            # loop so one slow callback cannot serialize a connection burst.
-            await self.loop.run_in_executor(
-                self.auth_executor,
-                self.hm_protocol.handle_new_client,
-                self.client,
+        initialize_protocol = getattr(
+            self.hm_protocol,
+            "handle_new_client_protocol",
+            None,
+        )
+        publish_lifecycle = getattr(
+            self.hm_protocol,
+            "handle_client_connected",
+            None,
+        )
+        if (
+                callable(initialize_protocol)
+                and callable(publish_lifecycle)
+                and self.connect_lifecycle_executor is not None
+        ):
+            try:
+                initialized = await self.loop.run_in_executor(
+                    self.auth_executor,
+                    initialize_protocol,
+                    self.client,
+                )
+            except Exception:
+                LOG.exception("Client protocol admission failed")
+                self.close(code=1011, reason="client admission unavailable")
+                return
+            if not initialized:
+                return
+            try:
+                lifecycle = self.connect_lifecycle_executor.submit(
+                    publish_lifecycle,
+                    self.client,
+                )
+            except RuntimeError:
+                LOG.exception("Client lifecycle executor rejected callback")
+                self.close(code=1011, reason="client lifecycle unavailable")
+                return
+            lifecycle.add_done_callback(
+                lambda future: _finish_connect_lifecycle(self, future)
             )
-        except Exception:
-            LOG.exception("Client admission callback failed")
-            self.close(code=1011, reason="client admission unavailable")
-            return
+            self._connect_lifecycle_future = lifecycle
+        else:
+            try:
+                # Compatibility with cores that expose one combined admission
+                # callback. Keep its synchronous I/O off Tornado's event loop.
+                await self.loop.run_in_executor(
+                    self.auth_executor,
+                    self.hm_protocol.handle_new_client,
+                    self.client,
+                )
+            except Exception:
+                LOG.exception("Client admission callback failed")
+                self.close(code=1011, reason="client admission unavailable")
+                return
         # self.write_message(Message("connected").serialize())
 
     def on_close(self):
@@ -752,7 +836,23 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 f"(no client was ever attached)"
             )
             return
+        if self._disconnect_submitted:
+            return
+        self._disconnect_submitted = True
         LOG.debug(f"disconnecting client: {self._peer_label(client.peer)}")
+        lifecycle = self._connect_lifecycle_future
+        if lifecycle is not None and not lifecycle.done():
+            lifecycle.add_done_callback(
+                lambda _future: self.loop.add_callback(
+                    self._submit_disconnect_callback,
+                    client,
+                )
+            )
+            return
+        self._submit_disconnect_callback(client)
+
+    def _submit_disconnect_callback(self, client):
+        """Publish disconnect only after this client's connect lifecycle."""
         executor = self.disconnect_executor
         if executor is None:
             # Embedded/test harnesses may install the handler without starting
