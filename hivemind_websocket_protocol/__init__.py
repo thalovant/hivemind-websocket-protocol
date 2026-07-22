@@ -58,6 +58,7 @@ DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
+DEFAULT_PREFER_PRESHARED_KEY = False
 
 
 _HANDSHAKE_TEMPLATE_CACHE: Dict[
@@ -212,6 +213,20 @@ def _positive_int(value: Any, default: int, name: str) -> int:
     return parsed
 
 
+def _boolean(value: Any, default: bool, name: str) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    LOG.warning(f"Ignoring invalid {name}: {value!r}")
+    return default
+
+
 @dataclasses.dataclass
 class HiveMindWebsocketProtocol(NetworkProtocol):
     """
@@ -246,6 +261,16 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             ),
         }
 
+    def _prefer_preshared_key(self) -> bool:
+        return _boolean(
+            self.config.get(
+                "prefer_preshared_key",
+                os.getenv("HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY"),
+            ),
+            DEFAULT_PREFER_PRESHARED_KEY,
+            "prefer_preshared_key",
+        )
+
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio_loop = asyncio.new_event_loop()
@@ -279,6 +304,9 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         HiveMindTornadoWebSocket.auth_executor = auth_executor
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
         HiveMindTornadoWebSocket.password_min_bits = password_min_bits
+        HiveMindTornadoWebSocket.prefer_preshared_key = (
+            self._prefer_preshared_key()
+        )
 
         if "trusted_proxy_cidrs" in self.config:
             proxy_cidrs = self.config["trusted_proxy_cidrs"]
@@ -407,6 +435,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     auth_executor: Optional[ThreadPoolExecutor] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
     password_min_bits: Optional[float] = None
+    prefer_preshared_key: bool = DEFAULT_PREFER_PRESHARED_KEY
     source_ip: Optional[str] = None
     _sync_lock = Lock()
     _last_sync_ts = 0.0
@@ -638,7 +667,9 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.can_propagate = user.can_propagate
         self.client.can_escalate = user.can_escalate
         self.client.is_admin = user.is_admin
-        if user.password:
+        if user.password and not (
+                self.prefer_preshared_key and self.client.crypto_key
+        ):
             # pre-shared password to derive aes_key
             self.client.pswd_handshake = await self.loop.run_in_executor(
                 self.handshake_executor,

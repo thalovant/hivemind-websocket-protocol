@@ -24,6 +24,7 @@ from tornado.websocket import WebSocketClosedError
 from hivemind_websocket_protocol import (
     DEFAULT_AUTH_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
+    DEFAULT_PREFER_PRESHARED_KEY,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
     _HANDSHAKE_TEMPLATE_CACHE,
@@ -563,6 +564,65 @@ def test_open_keeps_password_validation_off_event_loop(open_handler, monkeypatch
     assert elapsed < 0.25
     assert all(handler.client.pswd_handshake.password == user.password for handler in handlers)
     assert all(handler.client.pswd_handshake.min_bits == 40.0 for handler in handlers)
+
+
+def test_open_skips_password_handshake_when_preshared_key_is_preferred(
+        open_handler, monkeypatch):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+    user.crypto_key = "0123456789abcdef"
+    build_handshake = Mock()
+    monkeypatch.setattr(
+        websocket_protocol,
+        "_new_password_handshake",
+        build_handshake,
+    )
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    handler.prefer_preshared_key = True
+
+    _run_open(handler)
+
+    assert handler.client.crypto_key == user.crypto_key
+    assert handler.client.pswd_handshake is None
+    build_handshake.assert_not_called()
+
+
+def test_open_keeps_password_handshake_without_preshared_key(
+        open_handler, monkeypatch):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+    build_handshake = Mock(
+        return_value=SimpleNamespace(password=user.password),
+    )
+    monkeypatch.setattr(
+        websocket_protocol,
+        "_new_password_handshake",
+        build_handshake,
+    )
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    handler.prefer_preshared_key = True
+
+    _run_open(handler)
+
+    build_handshake.assert_called_once()
+    assert handler.client.pswd_handshake.password == user.password
+
+
+def test_prefer_preshared_key_is_opt_in_and_config_overrides_env(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
+    assert proto._prefer_preshared_key() is DEFAULT_PREFER_PRESHARED_KEY
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY", "true")
+    assert proto._prefer_preshared_key() is True
+    assert HiveMindWebsocketProtocol(
+        config={"prefer_preshared_key": False},
+    )._prefer_preshared_key() is False
 
 
 def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeypatch):

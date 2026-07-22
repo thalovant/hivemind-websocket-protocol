@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3a9](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a9) (2026-07-22)
+
+- Add an opt-in pre-shared-key preference that avoids constructing an unused,
+  CPU-intensive password handshake when a client already has a crypto key.
+- Preserve password negotiation for clients without a crypto key and keep the
+  default behavior backward-compatible.
+
 ## [0.2.3a6](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a6) (2026-07-21)
 
 - Cache successful strength validation by a bounded, process-keyed credential
