@@ -23,6 +23,7 @@ from tornado.websocket import WebSocketClosedError
 
 from hivemind_websocket_protocol import (
     DEFAULT_AUTH_EXECUTOR_WORKERS,
+    DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
     DEFAULT_PREFER_PRESHARED_KEY,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
@@ -31,6 +32,7 @@ from hivemind_websocket_protocol import (
     _PASSWORD_STRENGTH_CACHE,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
+    _finish_disconnect_callback,
     _finish_websocket_write,
     _new_client_handshake,
     _new_password_handshake,
@@ -103,6 +105,18 @@ def test_synchronous_closed_websocket_write_is_routine():
     _write_websocket_message(handler, "payload", False)
 
     handler.write_message.assert_called_once_with("payload", False)
+
+
+def test_disconnect_callback_failures_are_observed(monkeypatch):
+    logged = []
+    future = Future()
+    future.set_exception(RuntimeError("disconnect failed"))
+    monkeypatch.setattr(websocket_protocol.LOG, "error", logged.append)
+
+    _finish_disconnect_callback(future)
+
+    assert len(logged) == 1
+    assert "RuntimeError" in logged[0]
 
 
 def test_password_handshakes_are_processed_concurrently_off_event_loop():
@@ -691,6 +705,7 @@ def test_open_uses_startup_password_policy_snapshot(open_handler, monkeypatch):
 def test_executor_worker_defaults_cover_guarded_admission_burst():
     assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
     assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
+    assert DEFAULT_DISCONNECT_EXECUTOR_WORKERS == 1
 
 
 def test_open_runs_admission_callbacks_concurrently(open_handler):
@@ -720,6 +735,46 @@ def test_open_runs_admission_callbacks_concurrently(open_handler):
 
     assert elapsed < 0.25
     assert len(seen_clients) == 8
+
+
+def test_close_defers_ordered_disconnect_callbacks_off_event_loop():
+    calls = []
+    first_finished = threading.Event()
+    second_finished = threading.Event()
+
+    def disconnect(client):
+        calls.append(("start", client.peer))
+        time.sleep(0.05)
+        calls.append(("finish", client.peer))
+        (first_finished if client.peer == "first" else second_finished).set()
+
+    protocol = SimpleNamespace(handle_client_disconnected=disconnect)
+    handlers = []
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        for peer in ("first", "second"):
+            handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+            handler.hm_protocol = protocol
+            handler.disconnect_executor = executor
+            handler.client = SimpleNamespace(peer=peer)
+            handler.source_ip = "127.0.0.1"
+            handler.request = SimpleNamespace(remote_ip="127.0.0.1")
+            handlers.append(handler)
+
+        started = time.monotonic()
+        handlers[0].on_close()
+        handlers[1].on_close()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.03
+        assert first_finished.wait(1)
+        assert second_finished.wait(1)
+
+    assert calls == [
+        ("start", "first"),
+        ("finish", "first"),
+        ("start", "second"),
+        ("finish", "second"),
+    ]
 
 
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):
