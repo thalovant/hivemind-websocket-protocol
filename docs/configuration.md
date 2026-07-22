@@ -35,10 +35,13 @@ When inactive, `remote_ip` from the Tornado request is used as-is.
 |---|---|---|---|
 | `websocket_ping_interval` | `HIVEMIND_WEBSOCKET_PING_INTERVAL` | `30.0` | Seconds between WebSocket ping frames. |
 | `websocket_ping_timeout` | `HIVEMIND_WEBSOCKET_PING_TIMEOUT` | `20.0` | Seconds to wait for pong before closing the connection. |
+| `auth_executor_workers` | `HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS` | `64` | Workers for remote authorization and admission callbacks. |
+| `handshake_executor_workers` | `HIVEMIND_WEBSOCKET_HANDSHAKE_EXECUTOR_WORKERS` | `32` | Workers for password and protocol handshake work. |
+| `disconnect_executor_workers` | `HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS` | `1` | Ordered workers for disconnect lifecycle callbacks; keep at `1` unless the callback chain is proven thread-safe. |
 | `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `false` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. Clients without a crypto key still receive full password validation. |
 
-These values are passed to Tornado's WebSocket server settings. Invalid,
-negative, or non-finite values fall back to the defaults.
+Invalid, negative, non-finite, or non-positive values fall back to the
+applicable defaults.
 
 ### Example — nginx on localhost
 

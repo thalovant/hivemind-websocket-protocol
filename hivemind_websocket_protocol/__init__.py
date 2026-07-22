@@ -59,6 +59,7 @@ DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
 DEFAULT_PREFER_PRESHARED_KEY = False
+DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
 
 
 _HANDSHAKE_TEMPLATE_CACHE: Dict[
@@ -159,6 +160,18 @@ def _finish_websocket_write(future: Any) -> None:
         "HiveMind websocket write failed: "
         f"{type(error).__name__}: {error!r}"
     )
+
+
+def _finish_disconnect_callback(future: Any) -> None:
+    """Observe deferred disconnect failures without blocking Tornado."""
+    if future.cancelled():
+        return
+    error = future.exception()
+    if error is not None:
+        LOG.error(
+            "HiveMind websocket disconnect callback failed: "
+            f"{type(error).__name__}: {error!r}"
+        )
 
 
 def _write_websocket_message(handler: WebSocketHandler,
@@ -299,10 +312,22 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             ),
             thread_name_prefix="hivemind-wss-handshake",
         )
+        disconnect_executor = ThreadPoolExecutor(
+            max_workers=_positive_int(
+                self.config.get(
+                    "disconnect_executor_workers",
+                    os.getenv("HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS"),
+                ),
+                DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
+                "disconnect_executor_workers",
+            ),
+            thread_name_prefix="hivemind-wss-disconnect",
+        )
         HiveMindTornadoWebSocket.loop = loop
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
+        HiveMindTornadoWebSocket.disconnect_executor = disconnect_executor
         HiveMindTornadoWebSocket.password_min_bits = password_min_bits
         HiveMindTornadoWebSocket.prefer_preshared_key = (
             self._prefer_preshared_key()
@@ -371,9 +396,11 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         finally:
             HiveMindTornadoWebSocket.auth_executor = None
             HiveMindTornadoWebSocket.handshake_executor = None
+            HiveMindTornadoWebSocket.disconnect_executor = None
             HiveMindTornadoWebSocket.password_min_bits = None
             auth_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
+            disconnect_executor.shutdown(wait=True, cancel_futures=True)
         if startup_error is not None:
             raise startup_error
 
@@ -434,6 +461,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     hm_protocol = None
     auth_executor: Optional[ThreadPoolExecutor] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
+    disconnect_executor: Optional[ThreadPoolExecutor] = None
     password_min_bits: Optional[float] = None
     prefer_preshared_key: bool = DEFAULT_PREFER_PRESHARED_KEY
     source_ip: Optional[str] = None
@@ -725,7 +753,25 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             )
             return
         LOG.debug(f"disconnecting client: {self._peer_label(client.peer)}")
-        self.hm_protocol.handle_client_disconnected(client)
+        executor = self.disconnect_executor
+        if executor is None:
+            # Embedded/test harnesses may install the handler without starting
+            # HiveMindWebsocketProtocol.run(), which owns the executor. Retain
+            # the historical synchronous behavior for those integrations.
+            self.hm_protocol.handle_client_disconnected(client)
+            return
+        try:
+            future = executor.submit(
+                self.hm_protocol.handle_client_disconnected,
+                client,
+            )
+        except RuntimeError as error:
+            LOG.warning(
+                "HiveMind websocket disconnect executor rejected callback: "
+                f"{error!r}"
+            )
+            return
+        future.add_done_callback(_finish_disconnect_callback)
 
     def check_origin(self, origin) -> bool:
         return True

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3a11](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a11) (2026-07-22)
+
+- Move disconnect lifecycle callbacks, including synchronous runtime-bus
+  presence writes, off Tornado's event-loop thread.
+- Preserve disconnect notification order with a dedicated single-worker
+  executor so short-lived connection waves cannot starve new handshakes.
+
 ## [0.2.3a10](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a10) (2026-07-22)
 
 - Retain the password-handshake compatibility advertisement when pre-shared
