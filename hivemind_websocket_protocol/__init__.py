@@ -667,15 +667,22 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.can_propagate = user.can_propagate
         self.client.can_escalate = user.can_escalate
         self.client.is_admin = user.is_admin
-        if user.password and not (
-                self.prefer_preshared_key and self.client.crypto_key
-        ):
-            # pre-shared password to derive aes_key
+        if user.password:
+            # Keep the password handshake available so the core advertises a
+            # protocol ceiling compatible with its configured floor. Managed
+            # clients that already have a high-entropy crypto key use that PSK,
+            # so their password-strength analysis is redundant and need not
+            # serialize an otherwise concurrent admission burst.
+            min_bits = (
+                0.0
+                if self.prefer_preshared_key and self.client.crypto_key
+                else self.password_min_bits
+            )
             self.client.pswd_handshake = await self.loop.run_in_executor(
                 self.handshake_executor,
                 _new_password_handshake,
                 user.password,
-                self.password_min_bits,
+                min_bits,
             )
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
