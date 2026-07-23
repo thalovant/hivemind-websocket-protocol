@@ -751,6 +751,10 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self.close()
             return
 
+        cache_resolved_user = getattr(self.client, "cache_resolved_user", None)
+        if callable(cache_resolved_user):
+            cache_resolved_user(user)
+
         self.client.name = f"{useragent}::{user.client_id}::{user.name}"
         self.client.crypto_key = user.crypto_key
         self.client.skill_blacklist = user.skill_blacklist or []

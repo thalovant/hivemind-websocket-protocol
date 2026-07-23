@@ -493,6 +493,25 @@ def test_open_uses_direct_api_key_lookup_without_sync(open_handler):
     assert len(seen_clients) == 1
 
 
+def test_open_seeds_core_resolved_user_cache(open_handler, monkeypatch):
+    user = _auth_user()
+    cached = []
+    monkeypatch.setattr(
+        websocket_protocol.HiveMindClientConnection,
+        "cache_resolved_user",
+        lambda client, resolved: cached.append((client, resolved)),
+        raising=False,
+    )
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+
+    _run_open(handler)
+
+    assert cached == [(handler.client, user)]
+
+
 def test_open_syncs_local_database_once_after_api_key_miss(open_handler):
     user = _auth_user(client_id=2, name="fresh-client")
     state = {"synced": False, "syncs": 0}
