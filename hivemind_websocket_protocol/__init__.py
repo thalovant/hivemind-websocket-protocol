@@ -751,9 +751,11 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self.close()
             return
 
+        resolved_user_cache_seeded = False
         cache_resolved_user = getattr(self.client, "cache_resolved_user", None)
         if callable(cache_resolved_user):
             cache_resolved_user(user)
+            resolved_user_cache_seeded = True
 
         self.client.name = f"{useragent}::{user.client_id}::{user.name}"
         self.client.crypto_key = user.crypto_key
@@ -770,18 +772,23 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             # protocol ceiling compatible with its configured floor. Managed
             # clients that already have a high-entropy crypto key use that PSK,
             # so their password-strength analysis is redundant and need not
-            # serialize an otherwise concurrent admission burst.
-            min_bits = (
-                0.0
-                if self.prefer_preshared_key and self.client.crypto_key
-                else self.password_min_bits
-            )
-            self.client.pswd_handshake = await self.loop.run_in_executor(
-                self.handshake_executor,
-                _new_password_handshake,
-                user.password,
-                min_bits,
-            )
+            # serialize an otherwise concurrent admission burst. Building the
+            # compatibility object with validation disabled is bounded,
+            # in-memory work, so avoid a thread-pool round trip on that PSK
+            # fast path. Password-only clients retain executor isolation for
+            # strength validation.
+            if self.prefer_preshared_key and self.client.crypto_key:
+                self.client.pswd_handshake = _new_password_handshake(
+                    user.password,
+                    0.0,
+                )
+            else:
+                self.client.pswd_handshake = await self.loop.run_in_executor(
+                    self.handshake_executor,
+                    _new_password_handshake,
+                    user.password,
+                    self.password_min_bits,
+                )
         password_ms = (time.monotonic() - password_started) * 1000
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
@@ -806,6 +813,11 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             "handle_new_client_protocol",
             None,
         )
+        initialize_cached_protocol = getattr(
+            self.hm_protocol,
+            "handle_new_client_protocol_cached",
+            None,
+        )
         publish_lifecycle = getattr(
             self.hm_protocol,
             "handle_client_connected",
@@ -817,11 +829,20 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 and self.connect_lifecycle_executor is not None
         ):
             try:
-                initialized = await self.loop.run_in_executor(
-                    self.auth_executor,
-                    initialize_protocol,
-                    self.client,
-                )
+                if (resolved_user_cache_seeded
+                        and callable(initialize_cached_protocol)):
+                    # Current cores expose an explicitly cache-guarded, bounded
+                    # initializer. It refuses stale state before any protocol
+                    # metadata lookup, so this direct call cannot move remote
+                    # credential I/O onto Tornado's event loop. Older cores
+                    # retain the executor path below.
+                    initialized = initialize_cached_protocol(self.client)
+                else:
+                    initialized = await self.loop.run_in_executor(
+                        self.auth_executor,
+                        initialize_protocol,
+                        self.client,
+                    )
             except Exception:
                 LOG.exception("Client protocol admission failed")
                 self.close(code=1011, reason="client admission unavailable")
