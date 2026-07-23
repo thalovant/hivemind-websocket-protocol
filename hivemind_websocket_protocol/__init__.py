@@ -57,6 +57,7 @@ DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
+DEFAULT_PROTOCOL_EXECUTOR_WORKERS = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
 DEFAULT_PREFER_PRESHARED_KEY = True
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
@@ -332,6 +333,17 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             ),
             thread_name_prefix="hivemind-wss-auth",
         )
+        protocol_executor = ThreadPoolExecutor(
+            max_workers=_positive_int(
+                self.config.get(
+                    "protocol_executor_workers",
+                    os.getenv("HIVEMIND_WEBSOCKET_PROTOCOL_EXECUTOR_WORKERS"),
+                ),
+                DEFAULT_PROTOCOL_EXECUTOR_WORKERS,
+                "protocol_executor_workers",
+            ),
+            thread_name_prefix="hivemind-wss-protocol",
+        )
         handshake_executor = ThreadPoolExecutor(
             max_workers=_positive_int(
                 self.config.get(
@@ -370,6 +382,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         HiveMindTornadoWebSocket.loop = loop
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
+        HiveMindTornadoWebSocket.protocol_executor = protocol_executor
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
         HiveMindTornadoWebSocket.disconnect_executor = disconnect_executor
         HiveMindTornadoWebSocket.connect_lifecycle_executor = (
@@ -445,6 +458,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             loop.start()  # blocking
         finally:
             HiveMindTornadoWebSocket.auth_executor = None
+            HiveMindTornadoWebSocket.protocol_executor = None
             HiveMindTornadoWebSocket.handshake_executor = None
             HiveMindTornadoWebSocket.disconnect_executor = None
             HiveMindTornadoWebSocket.connect_lifecycle_executor = None
@@ -453,6 +467,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                 DEFAULT_SLOW_ADMISSION_LOG_MS
             )
             auth_executor.shutdown(wait=True, cancel_futures=True)
+            protocol_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
             connect_lifecycle_executor.shutdown(
                 wait=True,
@@ -518,6 +533,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     """
     hm_protocol = None
     auth_executor: Optional[ThreadPoolExecutor] = None
+    protocol_executor: Optional[ThreadPoolExecutor] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
     disconnect_executor: Optional[ThreadPoolExecutor] = None
     connect_lifecycle_executor: Optional[ThreadPoolExecutor] = None
@@ -831,12 +847,16 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             try:
                 if (resolved_user_cache_seeded
                         and callable(initialize_cached_protocol)):
-                    # Current cores expose an explicitly cache-guarded, bounded
-                    # initializer. It refuses stale state before any protocol
-                    # metadata lookup, so this direct call cannot move remote
-                    # credential I/O onto Tornado's event loop. Older cores
-                    # retain the executor path below.
-                    initialized = initialize_cached_protocol(self.client)
+                    # Current cores expose an explicitly cache-guarded,
+                    # bounded initializer. Keep its frame construction and
+                    # transport callbacks off Tornado's single event loop, and
+                    # isolate that work from remote credential lookups so a
+                    # concurrent protocol burst cannot delay auth completions.
+                    initialized = await self.loop.run_in_executor(
+                        self.protocol_executor or self.auth_executor,
+                        initialize_cached_protocol,
+                        self.client,
+                    )
                 else:
                     initialized = await self.loop.run_in_executor(
                         self.auth_executor,
