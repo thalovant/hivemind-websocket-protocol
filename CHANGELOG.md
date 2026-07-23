@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3a13](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a13) (2026-07-23)
+
+- Prefer an already-provisioned high-entropy pre-shared key by default so
+  managed identity bursts do not serialize redundant password-strength work.
+- Emit credential-free authorization, password, and protocol stage timings for
+  slow WebSocket admission to make production tail latency diagnosable.
+
 ## [0.2.3a11](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a11) (2026-07-22)
 
 - Move disconnect lifecycle callbacks, including synchronous runtime-bus

@@ -58,9 +58,10 @@ DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
-DEFAULT_PREFER_PRESHARED_KEY = False
+DEFAULT_PREFER_PRESHARED_KEY = True
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
 DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS = 16
+DEFAULT_SLOW_ADMISSION_LOG_MS = 500.0
 
 
 _HANDSHAKE_TEMPLATE_CACHE: Dict[
@@ -304,6 +305,16 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             "prefer_preshared_key",
         )
 
+    def _slow_admission_log_ms(self) -> float:
+        return _non_negative_float(
+            self.config.get(
+                "slow_admission_log_ms",
+                os.getenv("HIVEMIND_WEBSOCKET_SLOW_ADMISSION_LOG_MS"),
+            ),
+            DEFAULT_SLOW_ADMISSION_LOG_MS,
+            "slow_admission_log_ms",
+        )
+
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio_loop = asyncio.new_event_loop()
@@ -367,6 +378,9 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         HiveMindTornadoWebSocket.password_min_bits = password_min_bits
         HiveMindTornadoWebSocket.prefer_preshared_key = (
             self._prefer_preshared_key()
+        )
+        HiveMindTornadoWebSocket.slow_admission_log_ms = (
+            self._slow_admission_log_ms()
         )
 
         if "trusted_proxy_cidrs" in self.config:
@@ -435,6 +449,9 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             HiveMindTornadoWebSocket.disconnect_executor = None
             HiveMindTornadoWebSocket.connect_lifecycle_executor = None
             HiveMindTornadoWebSocket.password_min_bits = None
+            HiveMindTornadoWebSocket.slow_admission_log_ms = (
+                DEFAULT_SLOW_ADMISSION_LOG_MS
+            )
             auth_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
             connect_lifecycle_executor.shutdown(
@@ -506,6 +523,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     connect_lifecycle_executor: Optional[ThreadPoolExecutor] = None
     password_min_bits: Optional[float] = None
     prefer_preshared_key: bool = DEFAULT_PREFER_PRESHARED_KEY
+    slow_admission_log_ms: float = DEFAULT_SLOW_ADMISSION_LOG_MS
     source_ip: Optional[str] = None
     _sync_lock = Lock()
     _last_sync_ts = 0.0
@@ -667,6 +685,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         """
         Handle a new client connection and perform authorization.
         """
+        admission_started = time.monotonic()
         self.source_ip = self._client_ip()
         auth = self.get_query_argument("authorization", None)
         try:
@@ -701,12 +720,14 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             handshake=_new_client_handshake(self.hm_protocol.identity.private_key),
         )
         self.client.source_ip = self.source_ip
+        lookup_started = time.monotonic()
         try:
             user: Optional[Client] = await self._lookup_client_by_api_key(key)
         except Exception:
             LOG.exception("Client database lookup failed during websocket authorization")
             self.close(code=1011, reason="client database unavailable")
             return
+        lookup_ms = (time.monotonic() - lookup_started) * 1000
         sync_error = False
         if not user:
             try:
@@ -739,6 +760,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.can_propagate = user.can_propagate
         self.client.can_escalate = user.can_escalate
         self.client.is_admin = user.is_admin
+        password_started = time.monotonic()
         if user.password:
             # Keep the password handshake available so the core advertises a
             # protocol ceiling compatible with its configured floor. Managed
@@ -756,6 +778,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 user.password,
                 min_bits,
             )
+        password_ms = (time.monotonic() - password_started) * 1000
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
 
@@ -773,6 +796,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self.close()
             return
 
+        protocol_started = time.monotonic()
         initialize_protocol = getattr(
             self.hm_protocol,
             "handle_new_client_protocol",
@@ -826,6 +850,17 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 LOG.exception("Client admission callback failed")
                 self.close(code=1011, reason="client admission unavailable")
                 return
+        protocol_ms = (time.monotonic() - protocol_started) * 1000
+        total_ms = (time.monotonic() - admission_started) * 1000
+        if total_ms >= self.slow_admission_log_ms:
+            LOG.info(
+                "Slow HiveMind websocket admission: "
+                f"lookup_ms={lookup_ms:.0f} "
+                f"password_ms={password_ms:.0f} "
+                f"protocol_ms={protocol_ms:.0f} "
+                f"total_ms={total_ms:.0f} "
+                f"preshared_key={self.client.crypto_key is not None}"
+            )
         # self.write_message(Message("connected").serialize())
 
     def on_close(self):

@@ -27,6 +27,7 @@ from hivemind_websocket_protocol import (
     DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
     DEFAULT_PREFER_PRESHARED_KEY,
+    DEFAULT_SLOW_ADMISSION_LOG_MS,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
     _HANDSHAKE_TEMPLATE_CACHE,
@@ -630,15 +631,50 @@ def test_open_keeps_password_handshake_without_preshared_key(
     assert handler.client.pswd_handshake.password == user.password
 
 
-def test_prefer_preshared_key_is_opt_in_and_config_overrides_env(monkeypatch):
-    proto = HiveMindWebsocketProtocol(config={})
-    assert proto._prefer_preshared_key() is DEFAULT_PREFER_PRESHARED_KEY
+def test_open_logs_credential_free_slow_admission_timings(
+        open_handler, monkeypatch):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+    info = Mock()
+    monkeypatch.setattr(websocket_protocol.LOG, "info", info)
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    handler.slow_admission_log_ms = 0
 
-    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY", "true")
+    _run_open(handler)
+
+    message = info.call_args.args[0]
+    assert "lookup_ms=" in message
+    assert "password_ms=" in message
+    assert "protocol_ms=" in message
+    assert "total_ms=" in message
+    assert "preshared_key=False" in message
+    assert "api-key" not in message
+    assert user.password not in message
+
+
+def test_prefer_preshared_key_is_default_and_config_overrides_env(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
     assert proto._prefer_preshared_key() is True
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY", "false")
+    assert proto._prefer_preshared_key() is False
     assert HiveMindWebsocketProtocol(
-        config={"prefer_preshared_key": False},
-    )._prefer_preshared_key() is False
+        config={"prefer_preshared_key": True},
+    )._prefer_preshared_key() is True
+
+
+def test_slow_admission_log_threshold_config_overrides_env(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
+    assert proto._slow_admission_log_ms() == DEFAULT_SLOW_ADMISSION_LOG_MS
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_SLOW_ADMISSION_LOG_MS", "125")
+    assert proto._slow_admission_log_ms() == 125.0
+    assert HiveMindWebsocketProtocol(
+        config={"slow_admission_log_ms": 250},
+    )._slow_admission_log_ms() == 250.0
 
 
 def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeypatch):

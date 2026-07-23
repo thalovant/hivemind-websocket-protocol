@@ -112,7 +112,8 @@ export HIVEMIND_TRUSTED_CLIENT_IP_HEADERS="x-forwarded-for"
 | `auth_executor_workers` | `HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS` | `64` | Workers for remote authorization and admission callbacks. |
 | `handshake_executor_workers` | `HIVEMIND_WEBSOCKET_HANDSHAKE_EXECUTOR_WORKERS` | `32` | Workers for password and protocol handshake work. |
 | `disconnect_executor_workers` | `HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS` | `1` | Ordered workers for disconnect lifecycle callbacks. |
-| `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `false` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. |
+| `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `true` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. Set `false` only for legacy password-validation behavior. |
+| `slow_admission_log_ms` | `HIVEMIND_WEBSOCKET_SLOW_ADMISSION_LOG_MS` | `500` | Emit credential-free stage timings for slow WebSocket application admission. |
 
 Both `trusted_proxy_cidrs` and `trusted_client_ip_headers` accept a string, list, or
 tuple. The feature is disabled unless at least one CIDR is configured.
