@@ -841,10 +841,16 @@ def test_open_returns_before_blocking_connect_lifecycle(open_handler):
     assert lifecycle_clients == [handler.client]
 
 
-def test_open_uses_cache_guarded_protocol_fast_path(open_handler):
+def test_open_uses_cache_guarded_protocol_fast_path(open_handler, monkeypatch):
     user = _auth_user()
     user.password = "strong-machine-secret"
     user.crypto_key = "0123456789abcdef"
+    monkeypatch.setattr(
+        websocket_protocol.HiveMindClientConnection,
+        "cache_resolved_user",
+        lambda client, resolved: setattr(client, "_resolved_user", resolved),
+        raising=False,
+    )
     handler = open_handler(
         SimpleNamespace(get_client_by_api_key=lambda key: user),
         seen_clients=[],
