@@ -33,10 +33,13 @@ manages one WebSocket connection per instance.
    `crypto_key`, `pswd_handshake` if a password is set).
 6. Check crypto requirements: if `require_crypto` is enabled and no pre-shared key
    or handshake is available, reject.
-7. When supported by the core, initialize handshake frames through
-   `handle_new_client_protocol(client)` and publish optional lifecycle events
-   asynchronously through `handle_client_connected(client)`. Older cores use
-   the combined `handle_new_client(client)` compatibility path.
+7. When supported by the core, initialize handshake frames through the
+   cache-guarded `handle_new_client_protocol_cached(client)` fast path and
+   publish optional lifecycle events asynchronously through
+   `handle_client_connected(client)`. The bounded fast path runs directly only
+   after this transport seeds the authenticated row; older cores and missing
+   cache state use the executor-backed `handle_new_client_protocol(client)` or
+   combined `handle_new_client(client)` compatibility paths.
 
 ### `on_message()`
 

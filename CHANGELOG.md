@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3a15](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a15) (2026-07-23)
+
+- Keep managed PSK admission on the event loop for bounded password-handshake
+  object creation and cached split-protocol initialization, avoiding two
+  executor queue round trips while preserving executor isolation for legacy
+  password validation and older cores.
+
 ## [0.2.3a14](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a14) (2026-07-23)
 
 - Seed the core connection cache with the client row already authenticated by

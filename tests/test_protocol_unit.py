@@ -618,11 +618,18 @@ def test_open_skips_password_strength_check_when_preshared_key_is_preferred(
     )
     handler.prefer_preshared_key = True
 
+    caller_thread = threading.get_ident()
+    handshake_threads = []
+    build_handshake.side_effect = lambda *_args: (
+        handshake_threads.append(threading.get_ident()) or password_handshake
+    )
+
     _run_open(handler)
 
     assert handler.client.crypto_key == user.crypto_key
     assert handler.client.pswd_handshake is password_handshake
     build_handshake.assert_called_once_with(user.password, 0.0)
+    assert handshake_threads == [caller_thread]
 
 
 def test_open_keeps_password_handshake_without_preshared_key(
@@ -832,6 +839,39 @@ def test_open_returns_before_blocking_connect_lifecycle(open_handler):
         lifecycle_executor.shutdown(wait=True)
 
     assert lifecycle_clients == [handler.client]
+
+
+def test_open_uses_cache_guarded_protocol_fast_path(open_handler):
+    user = _auth_user()
+    user.password = "strong-machine-secret"
+    user.crypto_key = "0123456789abcdef"
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    handler.prefer_preshared_key = True
+    protocol_threads = []
+    executor_protocol = Mock(return_value=True)
+    cached_protocol = Mock(
+        side_effect=lambda _client: (
+            protocol_threads.append(threading.get_ident()) or True
+        ),
+    )
+    handler.hm_protocol.handle_new_client_protocol = executor_protocol
+    handler.hm_protocol.handle_new_client_protocol_cached = cached_protocol
+    handler.hm_protocol.handle_client_connected = Mock()
+    lifecycle_executor = ThreadPoolExecutor(max_workers=1)
+    handler.connect_lifecycle_executor = lifecycle_executor
+    caller_thread = threading.get_ident()
+
+    try:
+        _run_open(handler)
+    finally:
+        lifecycle_executor.shutdown(wait=True)
+
+    cached_protocol.assert_called_once_with(handler.client)
+    executor_protocol.assert_not_called()
+    assert protocol_threads == [caller_thread]
 
 
 def test_close_waits_for_matching_connect_lifecycle(open_handler):
