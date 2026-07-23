@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.3a14](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a14) (2026-07-23)
+
+- Seed the core connection cache with the client row already authenticated by
+  the transport so protocol negotiation can reuse it instead of repeating a
+  remote database lookup during concurrent admission.
+
 ## [0.2.3a13](https://github.com/thalovant/hivemind-websocket-protocol/tree/0.2.3a13) (2026-07-23)
 
 - Prefer an already-provisioned high-entropy pre-shared key by default so

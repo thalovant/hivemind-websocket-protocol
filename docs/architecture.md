@@ -25,13 +25,18 @@ manages one WebSocket connection per instance.
 2. Read the `?authorization=` query parameter from the URL.
 3. Decode it with `decode_auth()` — Base64, format `name:key`. Reject with
    close code `1008` if decoding fails or credentials are empty.
-4. Look up the API key in `hm_protocol.db`. Close if not found.
+4. Look up the API key in `hm_protocol.db`. Close if not found, then seed the
+   connection's resolved-user cache with the authenticated row so core
+   protocol metadata checks do not repeat the remote lookup.
 5. Populate `HiveMindClientConnection` with permissions from the database record
    (`allowed_types`, `can_broadcast`, `can_escalate`, `can_propagate`, `is_admin`,
    `crypto_key`, `pswd_handshake` if a password is set).
 6. Check crypto requirements: if `require_crypto` is enabled and no pre-shared key
    or handshake is available, reject.
-7. Call `hm_protocol.handle_new_client(client)`.
+7. When supported by the core, initialize handshake frames through
+   `handle_new_client_protocol(client)` and publish optional lifecycle events
+   asynchronously through `handle_client_connected(client)`. Older cores use
+   the combined `handle_new_client(client)` compatibility path.
 
 ### `on_message()`
 
