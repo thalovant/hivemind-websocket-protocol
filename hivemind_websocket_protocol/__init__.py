@@ -12,7 +12,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from os import makedirs
 from os.path import exists, join
-from threading import Lock
+from threading import Lock, get_ident
 from socket import gethostname
 from typing import Dict, Any, Optional, Tuple
 
@@ -57,7 +57,6 @@ DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
-DEFAULT_PROTOCOL_EXECUTOR_WORKERS = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
 DEFAULT_PREFER_PRESHARED_KEY = True
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
@@ -333,17 +332,6 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             ),
             thread_name_prefix="hivemind-wss-auth",
         )
-        protocol_executor = ThreadPoolExecutor(
-            max_workers=_positive_int(
-                self.config.get(
-                    "protocol_executor_workers",
-                    os.getenv("HIVEMIND_WEBSOCKET_PROTOCOL_EXECUTOR_WORKERS"),
-                ),
-                DEFAULT_PROTOCOL_EXECUTOR_WORKERS,
-                "protocol_executor_workers",
-            ),
-            thread_name_prefix="hivemind-wss-protocol",
-        )
         handshake_executor = ThreadPoolExecutor(
             max_workers=_positive_int(
                 self.config.get(
@@ -380,9 +368,9 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             thread_name_prefix="hivemind-wss-connect-lifecycle",
         )
         HiveMindTornadoWebSocket.loop = loop
+        HiveMindTornadoWebSocket.event_loop_thread_id = get_ident()
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
-        HiveMindTornadoWebSocket.protocol_executor = protocol_executor
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
         HiveMindTornadoWebSocket.disconnect_executor = disconnect_executor
         HiveMindTornadoWebSocket.connect_lifecycle_executor = (
@@ -458,7 +446,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             loop.start()  # blocking
         finally:
             HiveMindTornadoWebSocket.auth_executor = None
-            HiveMindTornadoWebSocket.protocol_executor = None
+            HiveMindTornadoWebSocket.event_loop_thread_id = None
             HiveMindTornadoWebSocket.handshake_executor = None
             HiveMindTornadoWebSocket.disconnect_executor = None
             HiveMindTornadoWebSocket.connect_lifecycle_executor = None
@@ -467,7 +455,6 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                 DEFAULT_SLOW_ADMISSION_LOG_MS
             )
             auth_executor.shutdown(wait=True, cancel_futures=True)
-            protocol_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
             connect_lifecycle_executor.shutdown(
                 wait=True,
@@ -533,7 +520,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     """
     hm_protocol = None
     auth_executor: Optional[ThreadPoolExecutor] = None
-    protocol_executor: Optional[ThreadPoolExecutor] = None
+    event_loop_thread_id: Optional[int] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
     disconnect_executor: Optional[ThreadPoolExecutor] = None
     connect_lifecycle_executor: Optional[ThreadPoolExecutor] = None
@@ -716,12 +703,15 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         LOG.debug(f"Authorizing client from {self.source_ip or 'unknown'} - {useragent}")
 
         def do_send(payload: str, is_bin: bool):
-            self.loop.add_callback(
-                _write_websocket_message,
-                self,
-                payload,
-                is_bin,
-            )
+            if self.event_loop_thread_id == get_ident():
+                _write_websocket_message(self, payload, is_bin)
+            else:
+                self.loop.add_callback(
+                    _write_websocket_message,
+                    self,
+                    payload,
+                    is_bin,
+                )
 
         def do_disconnect():
             self.loop.add_callback(self.close)
@@ -848,15 +838,12 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 if (resolved_user_cache_seeded
                         and callable(initialize_cached_protocol)):
                     # Current cores expose an explicitly cache-guarded,
-                    # bounded initializer. Keep its frame construction and
-                    # transport callbacks off Tornado's single event loop, and
-                    # isolate that work from remote credential lookups so a
-                    # concurrent protocol burst cannot delay auth completions.
-                    initialized = await self.loop.run_in_executor(
-                        self.protocol_executor or self.auth_executor,
-                        initialize_cached_protocol,
-                        self.client,
-                    )
+                    # bounded initializer with no remote I/O. Run it inline so
+                    # its HELLO and HANDSHAKE frames are written immediately;
+                    # the isolated worker pool proved heavily GIL-throttled at
+                    # the production CPU limit and delayed otherwise-ready
+                    # sockets by several seconds.
+                    initialized = initialize_cached_protocol(self.client)
                 else:
                     initialized = await self.loop.run_in_executor(
                         self.auth_executor,

@@ -26,7 +26,6 @@ from hivemind_websocket_protocol import (
     DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS,
     DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
-    DEFAULT_PROTOCOL_EXECUTOR_WORKERS,
     DEFAULT_SLOW_ADMISSION_LOG_MS,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
@@ -464,6 +463,7 @@ def test_open_schedules_downstream_writes_on_ioloop(open_handler):
     handler.write_message = lambda payload, is_bin=False: writes.append(
         (payload, is_bin)
     )
+    handler.event_loop_thread_id = None
 
     _run_open(handler)
     handler.client.send_msg("payload", True)
@@ -473,6 +473,28 @@ def test_open_schedules_downstream_writes_on_ioloop(open_handler):
     callback, args, kwargs = scheduled.pop()
     callback(*args, **kwargs)
     assert writes == [("payload", True)]
+
+
+def test_open_writes_downstream_frames_directly_on_ioloop_thread(open_handler):
+    user = _auth_user()
+    writes = []
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: user),
+        seen_clients=[],
+    )
+    handler.event_loop_thread_id = threading.get_ident()
+    handler.loop = SimpleNamespace(
+        add_callback=Mock(side_effect=AssertionError("queued an IOLoop write")),
+    )
+    handler.write_message = lambda payload, is_bin=False: writes.append(
+        (payload, is_bin)
+    )
+
+    _run_open(handler)
+    handler.client.send_msg("payload", True)
+
+    assert writes == [("payload", True)]
+    handler.loop.add_callback.assert_not_called()
 
 
 def test_open_uses_direct_api_key_lookup_without_sync(open_handler):
@@ -767,7 +789,6 @@ def test_open_uses_startup_password_policy_snapshot(open_handler, monkeypatch):
 
 def test_executor_worker_defaults_cover_guarded_admission_burst():
     assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
-    assert DEFAULT_PROTOCOL_EXECUTOR_WORKERS >= 50
     assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
     assert DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS >= 8
     assert DEFAULT_DISCONNECT_EXECUTOR_WORKERS == 1
@@ -843,7 +864,7 @@ def test_open_returns_before_blocking_connect_lifecycle(open_handler):
     assert lifecycle_clients == [handler.client]
 
 
-def test_open_isolates_cache_guarded_protocol_from_event_loop(
+def test_open_writes_cache_guarded_frames_on_event_loop(
         open_handler, monkeypatch):
     user = _auth_user()
     user.password = "strong-machine-secret"
@@ -860,34 +881,39 @@ def test_open_isolates_cache_guarded_protocol_from_event_loop(
     )
     handler.prefer_preshared_key = True
     protocol_threads = []
+    protocol_writes = []
     executor_protocol = Mock(return_value=True)
     cached_protocol = Mock(
-        side_effect=lambda _client: (
-            protocol_threads.append(threading.get_ident()) or True
+        side_effect=lambda client: (
+            protocol_threads.append(threading.get_ident())
+            or client.send_msg("handshake-frame", False)
+            or True
         ),
     )
     handler.hm_protocol.handle_new_client_protocol = executor_protocol
     handler.hm_protocol.handle_new_client_protocol_cached = cached_protocol
     handler.hm_protocol.handle_client_connected = Mock()
     lifecycle_executor = ThreadPoolExecutor(max_workers=1)
-    protocol_executor = ThreadPoolExecutor(max_workers=1)
     handler.connect_lifecycle_executor = lifecycle_executor
-    handler.protocol_executor = protocol_executor
     caller_thread = threading.get_ident()
+    handler.event_loop_thread_id = caller_thread
+    handler.write_message = lambda payload, is_bin=False: protocol_writes.append(
+        (payload, is_bin)
+    )
 
     try:
         _run_open(handler)
     finally:
         lifecycle_executor.shutdown(wait=True)
-        protocol_executor.shutdown(wait=True)
 
     cached_protocol.assert_called_once_with(handler.client)
     executor_protocol.assert_not_called()
     assert len(protocol_threads) == 1
-    assert protocol_threads[0] != caller_thread
+    assert protocol_threads[0] == caller_thread
+    assert protocol_writes == [("handshake-frame", False)]
 
 
-def test_cached_protocol_burst_does_not_serialize_tornado_loop(
+def test_cached_protocol_burst_avoids_executor_completion_queue(
         open_handler, monkeypatch):
     user = _auth_user()
     monkeypatch.setattr(
@@ -903,18 +929,16 @@ def test_cached_protocol_burst_does_not_serialize_tornado_loop(
         )
         for _ in range(8)
     ]
-    protocol_executor = ThreadPoolExecutor(max_workers=8)
     lifecycle_executor = ThreadPoolExecutor(max_workers=8)
 
-    def cached_protocol(_client):
-        time.sleep(0.05)
+    def cached_protocol(client):
+        client.send_msg("handshake-frame", False)
         return True
 
     for handler in handlers:
         handler.hm_protocol.handle_new_client_protocol = Mock(return_value=True)
         handler.hm_protocol.handle_new_client_protocol_cached = cached_protocol
         handler.hm_protocol.handle_client_connected = Mock()
-        handler.protocol_executor = protocol_executor
         handler.connect_lifecycle_executor = lifecycle_executor
 
     async def run_all():
@@ -925,10 +949,9 @@ def test_cached_protocol_burst_does_not_serialize_tornado_loop(
         asyncio.run(run_all())
         elapsed = time.monotonic() - started
     finally:
-        protocol_executor.shutdown(wait=True)
         lifecycle_executor.shutdown(wait=True)
 
-    assert elapsed < 0.25
+    assert elapsed < 0.1
 
 
 def test_close_waits_for_matching_connect_lifecycle(open_handler):
