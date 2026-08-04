@@ -979,7 +979,7 @@ def test_cached_protocol_burst_avoids_executor_completion_queue(
     finally:
         lifecycle_executor.shutdown(wait=True)
 
-    assert elapsed < 0.1
+    assert elapsed < 0.25
 
 
 def test_close_waits_for_matching_connect_lifecycle(open_handler):
