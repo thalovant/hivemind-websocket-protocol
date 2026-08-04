@@ -165,8 +165,11 @@ def test_password_handshakes_are_processed_concurrently_off_event_loop():
 def test_on_message_logs_type_without_formatting_payload(monkeypatch):
     sentinel = "private user utterance"
     message = SimpleNamespace(
-        msg_type=websocket_protocol.HiveMessageType.PING,
-        payload={"utterance": sentinel},
+        msg_type=websocket_protocol.HiveMessageType.BUS,
+        payload=SimpleNamespace(
+            msg_type="intent",
+            context={"utterance": sentinel},
+        ),
     )
     handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
     handler.source_ip = None
@@ -183,7 +186,7 @@ def test_on_message_logs_type_without_formatting_payload(monkeypatch):
     debug.assert_called_once_with(
         "Received %s message: %s",
         "client-1",
-        websocket_protocol.HiveMessageType.PING,
+        websocket_protocol.HiveMessageType.BUS,
     )
     assert sentinel not in repr(debug.call_args)
     handler.hm_protocol.handle_message.assert_called_once_with(
