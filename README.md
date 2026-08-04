@@ -112,6 +112,9 @@ export HIVEMIND_TRUSTED_CLIENT_IP_HEADERS="x-forwarded-for"
 | `auth_executor_workers` | `HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS` | `64` | Workers for remote authorization and admission callbacks. |
 | `auth_queue_size` | `HIVEMIND_WEBSOCKET_AUTH_QUEUE_SIZE` | `64` | Additional authorization requests allowed to wait; excess sockets close with status `1013`. |
 | `handshake_executor_workers` | `HIVEMIND_WEBSOCKET_HANDSHAKE_EXECUTOR_WORKERS` | `32` | Workers for password and protocol handshake work. |
+| `inbound_executor_workers` | `HIVEMIND_WEBSOCKET_INBOUND_EXECUTOR_WORKERS` | `16` | Workers that decode and dispatch authenticated frames outside Tornado's I/O loop. |
+| `inbound_queue_size` | `HIVEMIND_WEBSOCKET_INBOUND_QUEUE_SIZE` | `1024` | Additional inbound frames allowed to wait globally; overload closes the owning socket with status `1013`. |
+| `inbound_client_queue_size` | `HIVEMIND_WEBSOCKET_INBOUND_CLIENT_QUEUE_SIZE` | `64` | Maximum running or waiting inbound frames for one client, preserving bounded per-client ordering. |
 | `disconnect_executor_workers` | `HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS` | `1` | Ordered workers for disconnect lifecycle callbacks. |
 | `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `true` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. Set `false` only for legacy password-validation behavior. |
 | `slow_admission_log_ms` | `HIVEMIND_WEBSOCKET_SLOW_ADMISSION_LOG_MS` | `500` | Emit credential-free stage timings for slow WebSocket application admission. |

@@ -80,11 +80,19 @@ class LatencyHistogram:
 ADMISSION_QUEUE = LatencyHistogram("hivemind_admission_queue_ms")
 REDIS_COMMAND = LatencyHistogram("hivemind_redis_command_ms")
 REDIS_DESERIALIZE = LatencyHistogram("hivemind_redis_deserialize_ms")
+INBOUND_QUEUE = LatencyHistogram("hivemind_inbound_queue_ms")
+INBOUND_PROCESSING = LatencyHistogram("hivemind_inbound_processing_ms")
 
 
 def performance_histograms() -> dict[str, dict[str, object]]:
     """Return all websocket listener performance histograms."""
     return {
         histogram.name: histogram.snapshot()
-        for histogram in (ADMISSION_QUEUE, REDIS_COMMAND, REDIS_DESERIALIZE)
+        for histogram in (
+            ADMISSION_QUEUE,
+            REDIS_COMMAND,
+            REDIS_DESERIALIZE,
+            INBOUND_QUEUE,
+            INBOUND_PROCESSING,
+        )
     }

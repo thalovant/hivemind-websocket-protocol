@@ -31,6 +31,9 @@ from hivemind_websocket_protocol import (
     DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS,
     DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
+    DEFAULT_INBOUND_CLIENT_QUEUE_SIZE,
+    DEFAULT_INBOUND_EXECUTOR_WORKERS,
+    DEFAULT_INBOUND_QUEUE_SIZE,
     DEFAULT_SLOW_ADMISSION_LOG_MS,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
@@ -51,11 +54,21 @@ def _reset_websocket_sync_state():
     HiveMindTornadoWebSocket._last_sync_error = None
     HiveMindTornadoWebSocket.auth_admission_capacity = None
     HiveMindTornadoWebSocket.auth_pending = 0
+    HiveMindTornadoWebSocket.inbound_executor = None
+    HiveMindTornadoWebSocket.inbound_slots = None
+    HiveMindTornadoWebSocket.inbound_admission_capacity = None
+    HiveMindTornadoWebSocket.inbound_client_queue_size = None
+    HiveMindTornadoWebSocket.inbound_pending = 0
     _PASSWORD_STRENGTH_CACHE.clear()
     yield
     _PASSWORD_STRENGTH_CACHE.clear()
     HiveMindTornadoWebSocket.auth_admission_capacity = None
     HiveMindTornadoWebSocket.auth_pending = 0
+    HiveMindTornadoWebSocket.inbound_executor = None
+    HiveMindTornadoWebSocket.inbound_slots = None
+    HiveMindTornadoWebSocket.inbound_admission_capacity = None
+    HiveMindTornadoWebSocket.inbound_client_queue_size = None
+    HiveMindTornadoWebSocket.inbound_pending = 0
 
 
 # --- version.py module load ------------------------------------------------
@@ -191,6 +204,47 @@ def test_authorization_admission_is_strictly_bounded():
     HiveMindTornadoWebSocket.auth_admission_capacity = None
 
 
+def test_inbound_admission_is_bounded_globally_and_per_client():
+    HiveMindTornadoWebSocket.inbound_admission_capacity = 3
+    HiveMindTornadoWebSocket.inbound_client_queue_size = 2
+    first = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    second = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+
+    assert first._reserve_inbound_admission() is True
+    assert first._reserve_inbound_admission() is True
+    assert first._reserve_inbound_admission() is False
+    assert second._reserve_inbound_admission() is True
+    assert second._reserve_inbound_admission() is False
+    assert HiveMindTornadoWebSocket.inbound_pending == 3
+
+    first._release_inbound_admission()
+    assert second._reserve_inbound_admission() is True
+    assert HiveMindTornadoWebSocket.inbound_pending == 3
+
+    first._release_inbound_admission()
+    second._release_inbound_admission()
+    second._release_inbound_admission()
+    assert HiveMindTornadoWebSocket.inbound_pending == 0
+
+
+def test_inbound_overload_closes_only_the_owning_socket():
+    HiveMindTornadoWebSocket.inbound_admission_capacity = 1
+    HiveMindTornadoWebSocket.inbound_client_queue_size = 1
+    blocker = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.close = Mock()
+
+    assert blocker._reserve_inbound_admission() is True
+    asyncio.run(handler.on_message("payload"))
+
+    handler.close.assert_called_once_with(
+        code=1013,
+        reason="inbound processing overloaded",
+    )
+    assert blocker._inbound_closed is False
+    blocker._release_inbound_admission()
+
+
 def test_disconnect_callback_failures_are_observed(monkeypatch):
     logged = []
     future = Future()
@@ -203,7 +257,7 @@ def test_disconnect_callback_failures_are_observed(monkeypatch):
     assert "RuntimeError" in logged[0]
 
 
-def test_password_handshakes_are_processed_concurrently_off_event_loop():
+def test_messages_from_different_clients_run_concurrently_off_event_loop():
     handled = []
 
     def slow_handshake(message, client):
@@ -233,15 +287,100 @@ def test_password_handshakes_are_processed_concurrently_off_event_loop():
         )
         handlers.append(handler)
 
-    async def run_all():
-        await asyncio.gather(*(handler.on_message("payload") for handler in handlers))
+    executor = ThreadPoolExecutor(max_workers=8)
 
-    started = time.monotonic()
-    asyncio.run(run_all())
-    elapsed = time.monotonic() - started
+    async def run_all():
+        slots = asyncio.Semaphore(8)
+        for handler in handlers:
+            handler.inbound_executor = executor
+            handler.inbound_slots = slots
+        started = time.monotonic()
+        await asyncio.gather(*(
+            handler.on_message("payload") for handler in handlers
+        ))
+        return time.monotonic() - started
+
+    try:
+        elapsed = asyncio.run(run_all())
+    finally:
+        executor.shutdown(wait=True)
 
     assert elapsed < 0.25
     assert len(handled) == 8
+
+
+def test_messages_from_one_client_preserve_receive_order():
+    handled = []
+    executor = ThreadPoolExecutor(max_workers=4)
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="ordered-client",
+        decode=lambda payload: SimpleNamespace(
+            msg_type=websocket_protocol.HiveMessageType.HANDSHAKE,
+            payload=payload,
+        ),
+    )
+    handler.hm_protocol = SimpleNamespace(
+        handle_message=lambda message, _client: handled.append(message.payload),
+    )
+    handler.loop = SimpleNamespace(
+        run_in_executor=lambda selected, callback, *args: (
+            asyncio.get_running_loop().run_in_executor(
+                selected,
+                callback,
+                *args,
+            )
+        ),
+    )
+    handler.inbound_executor = executor
+
+    async def run_all():
+        handler.inbound_slots = asyncio.Semaphore(4)
+        await asyncio.gather(*(
+            handler.on_message(payload) for payload in ("one", "two", "three")
+        ))
+
+    try:
+        asyncio.run(run_all())
+    finally:
+        executor.shutdown(wait=True)
+
+    assert handled == ["one", "two", "three"]
+
+
+def test_close_cancels_queued_inbound_work():
+    handled = Mock()
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="closing-client",
+        decode=Mock(),
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=handled)
+    handler.request = SimpleNamespace(remote_ip="127.0.0.1")
+    handler._auth_lookup_future = None
+    handler._auth_task = None
+    handler._auth_admission_reserved = False
+    handler._client_admitted = False
+
+    async def close_while_queued():
+        handler._ensure_inbound_state()
+        await handler._inbound_lock.acquire()
+        task = asyncio.create_task(handler.on_message("queued"))
+        await asyncio.sleep(0)
+        assert handler._inbound_pending == 1
+        handler.on_close()
+        handler._inbound_lock.release()
+        await task
+
+    asyncio.run(close_while_queued())
+
+    assert handler._inbound_closed is True
+    assert handler._inbound_pending == 0
+    assert HiveMindTornadoWebSocket.inbound_pending == 0
+    handler.client.decode.assert_not_called()
+    handled.assert_not_called()
 
 
 def test_on_message_logs_type_without_formatting_payload(monkeypatch):
@@ -848,6 +987,25 @@ def test_slow_admission_log_threshold_config_overrides_env(monkeypatch):
     )._slow_admission_log_ms() == 250.0
 
 
+def test_inbound_executor_settings_default_and_config_overrides_env(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
+    assert proto._inbound_executor_settings() == (
+        DEFAULT_INBOUND_EXECUTOR_WORKERS,
+        DEFAULT_INBOUND_QUEUE_SIZE,
+        DEFAULT_INBOUND_CLIENT_QUEUE_SIZE,
+    )
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_INBOUND_EXECUTOR_WORKERS", "8")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_INBOUND_QUEUE_SIZE", "512")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_INBOUND_CLIENT_QUEUE_SIZE", "32")
+    assert proto._inbound_executor_settings() == (8, 512, 32)
+    assert HiveMindWebsocketProtocol(config={
+        "inbound_executor_workers": 12,
+        "inbound_queue_size": 768,
+        "inbound_client_queue_size": 48,
+    })._inbound_executor_settings() == (12, 768, 48)
+
+
 def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeypatch):
     user = _auth_user()
     user.password = "strong-machine-secret"
@@ -913,6 +1071,9 @@ def test_open_uses_startup_password_policy_snapshot(open_handler, monkeypatch):
 def test_executor_worker_defaults_cover_guarded_admission_burst():
     assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
     assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
+    assert DEFAULT_INBOUND_EXECUTOR_WORKERS >= 8
+    assert DEFAULT_INBOUND_QUEUE_SIZE >= 400
+    assert DEFAULT_INBOUND_CLIENT_QUEUE_SIZE >= 16
     assert DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS >= 8
     assert DEFAULT_DISCONNECT_EXECUTOR_WORKERS == 1
 
