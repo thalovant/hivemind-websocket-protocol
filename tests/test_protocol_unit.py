@@ -161,6 +161,34 @@ def test_password_handshakes_are_processed_concurrently_off_event_loop():
     assert len(handled) == 8
 
 
+def test_on_message_logs_type_without_formatting_payload(monkeypatch):
+    sentinel = "private user utterance"
+    message = SimpleNamespace(
+        msg_type=websocket_protocol.HiveMessageType.PING,
+        payload={"utterance": sentinel},
+    )
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="client-1",
+        decode=lambda _payload: message,
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=Mock())
+    debug = Mock()
+    monkeypatch.setattr(websocket_protocol._log, "debug", debug)
+
+    asyncio.run(handler.on_message("wire payload"))
+
+    debug.assert_called_once_with(
+        "Received %s message: %s",
+        "client-1",
+        websocket_protocol.HiveMessageType.PING,
+    )
+    assert sentinel not in repr(debug.call_args)
+    handler.hm_protocol.handle_message.assert_called_once_with(
+        message, handler.client)
+
+
 def test_request_summary_redacts_authorization_query():
     handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
     handler.request = SimpleNamespace(

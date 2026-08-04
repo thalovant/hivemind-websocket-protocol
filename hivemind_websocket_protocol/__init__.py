@@ -3,6 +3,7 @@ import binascii
 import copy
 import dataclasses
 import hashlib
+import logging
 import math
 import os
 import os.path
@@ -73,6 +74,11 @@ _PASSWORD_STRENGTH_LOCK = Lock()
 _PASSWORD_STRENGTH_CACHE: "OrderedDict[Tuple[bytes, float], None]" = OrderedDict()
 _PASSWORD_STRENGTH_CACHE_KEY = os.urandom(32)
 _PASSWORD_STRENGTH_CACHE_SIZE = 4096
+
+# The websocket receive path runs on Tornado's single IOLoop. OVOS LOG.debug
+# resolves caller metadata with inspect.stack() even when DEBUG is disabled;
+# stdlib logging checks the level first and supports lazy argument formatting.
+_log = logging.getLogger(__name__)
 
 
 def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
@@ -623,9 +629,11 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 message.msg_type == HiveMessageType.BUS
                 and message.payload.msg_type == "recognizer_loop:b64_audio"
         ):
-            LOG.debug(f"Received {peer} sent base64 audio for STT")
+            _log.debug("Received %s sent base64 audio for STT", peer)
         else:
-            LOG.debug(f"Received {peer} message: {message}")
+            # Never format the full payload here: beyond the serialization
+            # cost, BUS frames can contain a user's transcribed speech.
+            _log.debug("Received %s message: %s", peer, message.msg_type)
         if message.msg_type == HiveMessageType.HANDSHAKE:
             # Password-key derivation uses PBKDF2 and must not serialize every
             # concurrent connection on Tornado's single event-loop thread.
