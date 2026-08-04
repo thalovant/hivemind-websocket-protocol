@@ -49,9 +49,13 @@ from hivescope.node import MasterNode
 def _reset_websocket_sync_state():
     HiveMindTornadoWebSocket._last_sync_ts = 0.0
     HiveMindTornadoWebSocket._last_sync_error = None
+    HiveMindTornadoWebSocket.auth_admission_capacity = None
+    HiveMindTornadoWebSocket.auth_pending = 0
     _PASSWORD_STRENGTH_CACHE.clear()
     yield
     _PASSWORD_STRENGTH_CACHE.clear()
+    HiveMindTornadoWebSocket.auth_admission_capacity = None
+    HiveMindTornadoWebSocket.auth_pending = 0
 
 
 # --- version.py module load ------------------------------------------------
@@ -107,6 +111,40 @@ def test_synchronous_closed_websocket_write_is_routine():
     _write_websocket_message(handler, "payload", False)
 
     handler.write_message.assert_called_once_with("payload", False)
+
+
+def test_websocket_write_completion_tracks_tornado_future():
+    tornado_future = Future()
+    handler = SimpleNamespace(write_message=Mock(return_value=tornado_future))
+
+    completion = _write_websocket_message(handler, "payload", False)
+    assert not completion.done()
+
+    tornado_future.set_result(None)
+    assert completion.result(timeout=0.1) is None
+
+
+def test_authorization_admission_is_strictly_bounded():
+    HiveMindTornadoWebSocket.auth_admission_capacity = 2
+    handlers = [
+        HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+        for _ in range(3)
+    ]
+    for handler in handlers:
+        handler._auth_admission_reserved = False
+
+    assert handlers[0]._reserve_auth_admission() is True
+    assert handlers[1]._reserve_auth_admission() is True
+    assert handlers[2]._reserve_auth_admission() is False
+    assert HiveMindTornadoWebSocket.auth_pending == 2
+
+    handlers[0]._release_auth_admission()
+    assert handlers[2]._reserve_auth_admission() is True
+    assert HiveMindTornadoWebSocket.auth_pending == 2
+
+    handlers[1]._release_auth_admission()
+    handlers[2]._release_auth_admission()
+    HiveMindTornadoWebSocket.auth_admission_capacity = None
 
 
 def test_disconnect_callback_failures_are_observed(monkeypatch):
@@ -1096,6 +1134,24 @@ def test_close_retains_embedded_handler_fallback_without_executor():
     handler.on_close()
 
     assert disconnected == [handler.client]
+
+
+def test_close_cancels_abandoned_authorization_work():
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    auth_lookup = Mock()
+    auth_lookup.done.return_value = False
+    auth_task = Mock()
+    auth_task.done.return_value = False
+    handler._auth_lookup_future = auth_lookup
+    handler._auth_task = auth_task
+    handler._auth_admission_reserved = False
+    handler._client_admitted = False
+    handler.request = SimpleNamespace(remote_ip="127.0.0.1")
+
+    handler.on_close()
+
+    auth_lookup.cancel.assert_called_once_with()
+    auth_task.cancel.assert_called_once_with()
 
 
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):

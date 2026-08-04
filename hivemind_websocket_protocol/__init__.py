@@ -10,7 +10,7 @@ import os.path
 import random
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from os import makedirs
 from os.path import exists, join
 from threading import Lock, get_ident
@@ -52,12 +52,18 @@ from hivemind_websocket_protocol._client_ip import (
     parse_networks,
     resolve_client_ip,
 )
+from hivemind_websocket_protocol._metrics import (
+    ADMISSION_QUEUE,
+    REDIS_COMMAND,
+    REDIS_DESERIALIZE,
+)
 
 
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
+DEFAULT_AUTH_QUEUE_SIZE = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
 DEFAULT_PREFER_PRESHARED_KEY = True
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
@@ -154,13 +160,22 @@ def _refresh_local_client_database(database: Any) -> bool:
     return True
 
 
-def _finish_websocket_write(future: Any) -> None:
+def _finish_websocket_write(future: Any,
+                            completion: Optional[Future] = None) -> None:
     """Consume asynchronous write failures so closed peers stay routine."""
+    if completion is None:
+        future.exception()
+        return
+    if completion.done():
+        return
     if future.cancelled():
+        completion.cancel()
         return
     error = future.exception()
     if error is None:
+        completion.set_result(None)
         return
+    completion.set_exception(error)
     if isinstance(error, (WebSocketClosedError, StreamClosedError)):
         LOG.debug("HiveMind websocket closed before a queued write completed")
         return
@@ -203,15 +218,23 @@ def _finish_connect_lifecycle(
 
 def _write_websocket_message(handler: WebSocketHandler,
                              payload: str,
-                             is_binary: bool) -> None:
+                             is_binary: bool,
+                             completion: Optional[Future] = None) -> Future:
     """Write a frame and observe both synchronous and future failures."""
+    completion = completion or Future()
     try:
         future = handler.write_message(payload, is_binary)
-    except (WebSocketClosedError, StreamClosedError):
+    except (WebSocketClosedError, StreamClosedError) as error:
+        completion.set_exception(error)
         LOG.debug("HiveMind websocket closed before a frame could be queued")
-        return
+        return completion
     if future is not None:
-        future.add_done_callback(_finish_websocket_write)
+        future.add_done_callback(
+            lambda pending: _finish_websocket_write(pending, completion)
+        )
+    else:
+        completion.set_result(None)
+    return completion
 
 
 def _split_csv(value: Any) -> Tuple[str, ...]:
@@ -321,21 +344,35 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             "slow_admission_log_ms",
         )
 
+    def _auth_executor_settings(self) -> Tuple[int, int]:
+        """Return bounded authorization worker and waiting-queue sizes."""
+        workers = _positive_int(
+            self.config.get(
+                "auth_executor_workers",
+                os.getenv("HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS"),
+            ),
+            DEFAULT_AUTH_EXECUTOR_WORKERS,
+            "auth_executor_workers",
+        )
+        queue_size = _positive_int(
+            self.config.get(
+                "auth_queue_size",
+                os.getenv("HIVEMIND_WEBSOCKET_AUTH_QUEUE_SIZE"),
+            ),
+            DEFAULT_AUTH_QUEUE_SIZE,
+            "auth_queue_size",
+        )
+        return workers, queue_size
+
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
         loop = ioloop.IOLoop.current()
         password_min_bits = runtime_password_min_bits()
+        auth_workers, auth_queue_size = self._auth_executor_settings()
         auth_executor = ThreadPoolExecutor(
-            max_workers=_positive_int(
-                self.config.get(
-                    "auth_executor_workers",
-                    os.getenv("HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS"),
-                ),
-                DEFAULT_AUTH_EXECUTOR_WORKERS,
-                "auth_executor_workers",
-            ),
+            max_workers=auth_workers,
             thread_name_prefix="hivemind-wss-auth",
         )
         handshake_executor = ThreadPoolExecutor(
@@ -377,6 +414,11 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         HiveMindTornadoWebSocket.event_loop_thread_id = get_ident()
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
+        HiveMindTornadoWebSocket.auth_slots = asyncio.Semaphore(auth_workers)
+        HiveMindTornadoWebSocket.auth_admission_capacity = (
+            auth_workers + auth_queue_size
+        )
+        HiveMindTornadoWebSocket.auth_pending = 0
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
         HiveMindTornadoWebSocket.disconnect_executor = disconnect_executor
         HiveMindTornadoWebSocket.connect_lifecycle_executor = (
@@ -452,6 +494,9 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             loop.start()  # blocking
         finally:
             HiveMindTornadoWebSocket.auth_executor = None
+            HiveMindTornadoWebSocket.auth_slots = None
+            HiveMindTornadoWebSocket.auth_admission_capacity = None
+            HiveMindTornadoWebSocket.auth_pending = 0
             HiveMindTornadoWebSocket.event_loop_thread_id = None
             HiveMindTornadoWebSocket.handshake_executor = None
             HiveMindTornadoWebSocket.disconnect_executor = None
@@ -526,6 +571,10 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     """
     hm_protocol = None
     auth_executor: Optional[ThreadPoolExecutor] = None
+    auth_slots: Optional[asyncio.Semaphore] = None
+    auth_admission_capacity: Optional[int] = None
+    auth_pending: int = 0
+    auth_pending_lock = Lock()
     event_loop_thread_id: Optional[int] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
     disconnect_executor: Optional[ThreadPoolExecutor] = None
@@ -540,6 +589,10 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     _sync_debounce_s = 1.0
     _connect_lifecycle_future: Optional[Any] = None
     _disconnect_submitted: bool = False
+    _auth_task: Optional[asyncio.Task] = None
+    _auth_lookup_future: Optional[Any] = None
+    _auth_admission_reserved: bool = False
+    _client_admitted: bool = False
 
     @staticmethod
     def _serialized_session(session: Any) -> dict[str, Any]:
@@ -680,23 +733,97 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             cls._last_sync_error = None
             return refreshed
 
-    async def _lookup_client_by_api_key(self, key: str) -> Optional[Client]:
+    def _reserve_auth_admission(self) -> bool:
+        """Reserve one running or queued authorization slot."""
+        capacity = self.auth_admission_capacity
+        if capacity is None:
+            self._auth_admission_reserved = True
+            return True
+        with self.auth_pending_lock:
+            if type(self).auth_pending >= capacity:
+                return False
+            type(self).auth_pending += 1
+            self._auth_admission_reserved = True
+            return True
+
+    def _release_auth_admission(self) -> None:
+        """Release a previously reserved authorization slot exactly once."""
+        if not self._auth_admission_reserved:
+            return
+        self._auth_admission_reserved = False
+        if self.auth_admission_capacity is None:
+            return
+        with self.auth_pending_lock:
+            type(self).auth_pending = max(0, type(self).auth_pending - 1)
+
+    async def _lookup_client_by_api_key(
+            self, key: str) -> Tuple[Optional[Client], Dict[str, float]]:
         """Keep remote credential I/O off Tornado's single event-loop thread."""
         database = self.hm_protocol.db
         backend = getattr(database, "db", database)
-        if isinstance(backend, AbstractRemoteDB):
-            return await self.loop.run_in_executor(
-                self.auth_executor,
-                database.get_client_by_api_key,
-                key,
+        try:
+            detailed_lookup = getattr(
+                database, "get_client_by_api_key_with_metrics", None
             )
-        return database.get_client_by_api_key(key)
+            lookup = (detailed_lookup if callable(detailed_lookup)
+                      else database.get_client_by_api_key)
+            if isinstance(backend, AbstractRemoteDB):
+                future = self.loop.run_in_executor(
+                    self.auth_executor,
+                    lookup,
+                    key,
+                )
+                self._auth_lookup_future = future
+                result = await future
+            else:
+                result = lookup(key)
+            if callable(detailed_lookup):
+                user, timings = result
+            else:
+                user, timings = result, {}
+            redis_command_ms = timings.get("redis_command_ms")
+            if redis_command_ms is not None:
+                REDIS_COMMAND.observe_ms(redis_command_ms)
+            redis_deserialize_ms = timings.get("redis_deserialize_ms")
+            if redis_deserialize_ms is not None:
+                REDIS_DESERIALIZE.observe_ms(redis_deserialize_ms)
+            return user, timings
+        finally:
+            self._auth_lookup_future = None
 
     async def open(self) -> None:
+        """Run one complete authorization inside the bounded admission gate."""
+        self._auth_task = asyncio.current_task()
+        self._auth_lookup_future = None
+        self._auth_admission_reserved = False
+        self._client_admitted = False
+        queue_started = time.monotonic()
+        acquired = False
+        if not self._reserve_auth_admission():
+            LOG.warning("Rejecting websocket because authorization is overloaded")
+            self.close(code=1013, reason="authorization overloaded")
+            self._auth_task = None
+            return
+        try:
+            if self.auth_slots is not None:
+                await self.auth_slots.acquire()
+                acquired = True
+            ADMISSION_QUEUE.observe_ms(
+                (time.monotonic() - queue_started) * 1000
+            )
+            await self._open_admitted(queue_started)
+        except asyncio.CancelledError:
+            LOG.debug("Websocket closed before authorization completed")
+        finally:
+            if acquired and self.auth_slots is not None:
+                self.auth_slots.release()
+            self._release_auth_admission()
+            self._auth_task = None
+
+    async def _open_admitted(self, admission_started: float) -> None:
         """
         Handle a new client connection and perform authorization.
         """
-        admission_started = time.monotonic()
         self.source_ip = self._client_ip()
         auth = self.get_query_argument("authorization", None)
         try:
@@ -711,15 +838,18 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         LOG.debug(f"Authorizing client from {self.source_ip or 'unknown'} - {useragent}")
 
         def do_send(payload: str, is_bin: bool):
+            completion = Future()
             if self.event_loop_thread_id == get_ident():
-                _write_websocket_message(self, payload, is_bin)
+                _write_websocket_message(self, payload, is_bin, completion)
             else:
                 self.loop.add_callback(
                     _write_websocket_message,
                     self,
                     payload,
                     is_bin,
+                    completion,
                 )
+            return completion
 
         def do_disconnect():
             self.loop.add_callback(self.close)
@@ -736,7 +866,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.source_ip = self.source_ip
         lookup_started = time.monotonic()
         try:
-            user: Optional[Client] = await self._lookup_client_by_api_key(key)
+            user, lookup_timings = await self._lookup_client_by_api_key(key)
         except Exception:
             LOG.exception("Client database lookup failed during websocket authorization")
             self.close(code=1011, reason="client database unavailable")
@@ -864,6 +994,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 return
             if not initialized:
                 return
+            self._client_admitted = True
             try:
                 lifecycle = self.connect_lifecycle_executor.submit(
                     publish_lifecycle,
@@ -886,6 +1017,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                     self.hm_protocol.handle_new_client,
                     self.client,
                 )
+                self._client_admitted = True
             except Exception:
                 LOG.exception("Client admission callback failed")
                 self.close(code=1011, reason="client admission unavailable")
@@ -896,6 +1028,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             LOG.info(
                 "Slow HiveMind websocket admission: "
                 f"lookup_ms={lookup_ms:.0f} "
+                f"redis_command_ms={lookup_timings.get('redis_command_ms', 0):.0f} "
+                f"redis_deserialize_ms={lookup_timings.get('redis_deserialize_ms', 0):.0f} "
                 f"password_ms={password_ms:.0f} "
                 f"protocol_ms={protocol_ms:.0f} "
                 f"total_ms={total_ms:.0f} "
@@ -904,8 +1038,17 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         # self.write_message(Message("connected").serialize())
 
     def on_close(self):
+        auth_future = self._auth_lookup_future
+        if auth_future is not None and not auth_future.done():
+            auth_future.cancel()
+        auth_task = self._auth_task
+        if auth_task is not None and not auth_task.done():
+            auth_task.cancel()
+        self._release_auth_admission()
         client = getattr(self, "client", None)
-        if client is None:
+        if (client is None
+                or ("_client_admitted" in self.__dict__
+                    and not self._client_admitted)):
             LOG.debug(
                 f"closing unauthenticated websocket from {self.request.remote_ip} "
                 f"(no client was ever attached)"
