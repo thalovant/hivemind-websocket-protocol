@@ -20,9 +20,13 @@ from unittest.mock import Mock, call
 import pybase64
 import pytest
 from hivemind_plugin_manager.database import AbstractRemoteDB
+from hivescope.node import MasterNode
 from tornado.websocket import WebSocketClosedError
 
+import hivemind_websocket_protocol as websocket_protocol
 from hivemind_websocket_protocol import (
+    _HANDSHAKE_TEMPLATE_CACHE,
+    _PASSWORD_STRENGTH_CACHE,
     DEFAULT_AUTH_EXECUTOR_WORKERS,
     DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS,
     DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
@@ -30,8 +34,6 @@ from hivemind_websocket_protocol import (
     DEFAULT_SLOW_ADMISSION_LOG_MS,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
-    _HANDSHAKE_TEMPLATE_CACHE,
-    _PASSWORD_STRENGTH_CACHE,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
     _finish_disconnect_callback,
@@ -41,8 +43,6 @@ from hivemind_websocket_protocol import (
     _refresh_local_client_database,
     _write_websocket_message,
 )
-import hivemind_websocket_protocol as websocket_protocol
-from hivescope.node import MasterNode
 
 
 @pytest.fixture(autouse=True)
@@ -130,15 +130,28 @@ def test_synchronous_websocket_write_failure_completes_send_contract(
     assert "RuntimeError" in logged[0]
 
 
-def test_canceled_websocket_write_is_not_queued():
-    """Do not deliver an abandoned frame after its callback was scheduled."""
-    handler = SimpleNamespace(write_message=Mock())
-    completion = Future()
+def test_canceled_websocket_write_is_not_queued(open_handler):
+    """Do not deliver a frame canceled after the public send scheduled it."""
+    scheduled = []
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: _auth_user()),
+        seen_clients=[],
+    )
+    handler.loop = SimpleNamespace(
+        add_callback=lambda callback, *args, **kwargs: scheduled.append(
+            (callback, args, kwargs)
+        )
+    )
+    handler.write_message = Mock()
+    handler.event_loop_thread_id = None
+
+    _run_open(handler)
+    completion = handler.client.send_msg("payload", False)
+    assert len(scheduled) == 1
     assert completion.cancel()
 
-    returned = _write_websocket_message(
-        handler, "payload", False, completion
-    )
+    callback, args, kwargs = scheduled.pop()
+    returned = callback(*args, **kwargs)
 
     assert returned is completion
     handler.write_message.assert_not_called()
@@ -538,7 +551,7 @@ def _open_handler(db, key="api-key", seen_clients=None,
         {"args": args, "kwargs": kwargs}
     )
     handler.get_query_argument = lambda name, default=None: pybase64.b64encode(
-        f"agent:{key}".encode("utf-8")
+        f"agent:{key}".encode()
     ).decode("ascii")
     return handler
 
@@ -1040,6 +1053,7 @@ def test_cached_protocol_burst_avoids_executor_completion_queue(
         for _ in range(8)
     ]
     lifecycle_executor = ThreadPoolExecutor(max_workers=8)
+    lifecycle_barrier = threading.Barrier(9)
 
     def cached_protocol(client):
         client.send_msg("handshake-frame", False)
@@ -1048,20 +1062,20 @@ def test_cached_protocol_burst_avoids_executor_completion_queue(
     for handler in handlers:
         handler.hm_protocol.handle_new_client_protocol = Mock(return_value=True)
         handler.hm_protocol.handle_new_client_protocol_cached = cached_protocol
-        handler.hm_protocol.handle_client_connected = Mock()
+        handler.hm_protocol.handle_client_connected = (
+            lambda _client: lifecycle_barrier.wait(timeout=1)
+        )
         handler.connect_lifecycle_executor = lifecycle_executor
 
     async def run_all():
         await asyncio.gather(*(handler.open() for handler in handlers))
 
     try:
-        started = time.monotonic()
         asyncio.run(run_all())
-        elapsed = time.monotonic() - started
+        lifecycle_barrier.wait(timeout=1)
     finally:
+        lifecycle_barrier.abort()
         lifecycle_executor.shutdown(wait=True)
-
-    assert elapsed < 0.25
 
 
 def test_close_waits_for_matching_connect_lifecycle(open_handler):
@@ -1377,7 +1391,7 @@ def test_run_raises_when_listener_bind_fails():
 
 def test_run_ssl_path_uses_existing_cert(tmp_path):
     """SSL branch in run(): existing cert is picked up; no regeneration."""
-    cert, key = HiveMindWebsocketProtocol.create_self_signed_cert(
+    _cert, _key = HiveMindWebsocketProtocol.create_self_signed_cert(
         cert_dir=str(tmp_path), name="ssl-test"
     )
     master = MasterNode.create("MS", require_crypto=False, handshake_enabled=True)

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterable
 from threading import Lock
-from typing import Dict, Iterable
 
 from ovos_utils.log import LOG
-
 
 DEFAULT_BUCKETS_MS = (
     1.0,
@@ -52,7 +52,7 @@ class LatencyHistogram:
             should_log = bool(
                 self._log_every and self._count % self._log_every == 0
             )
-        if should_log:
+        if should_log and LOG.isEnabledFor(logging.INFO):
             snapshot = self.snapshot()
             LOG.info(
                 "latency_histogram name=%s count=%d sum_ms=%.3f buckets=%s",
@@ -62,7 +62,7 @@ class LatencyHistogram:
                 snapshot["buckets"],
             )
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> dict[str, object]:
         """Return an immutable, JSON-friendly cumulative snapshot."""
         with self._lock:
             buckets = {
@@ -83,7 +83,7 @@ REDIS_COMMAND = LatencyHistogram("hivemind_redis_command_ms")
 REDIS_DESERIALIZE = LatencyHistogram("hivemind_redis_deserialize_ms")
 
 
-def performance_histograms() -> Dict[str, Dict[str, object]]:
+def performance_histograms() -> dict[str, dict[str, object]]:
     """Return all websocket listener performance histograms."""
     return {
         histogram.name: histogram.snapshot()
