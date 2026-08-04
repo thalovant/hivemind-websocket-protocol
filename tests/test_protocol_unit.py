@@ -7,6 +7,7 @@ Targets:
 - version.py module loading.
 """
 import asyncio
+import logging
 import os
 import socket
 import threading
@@ -187,6 +188,15 @@ def test_on_message_logs_type_without_formatting_payload(monkeypatch):
     assert sentinel not in repr(debug.call_args)
     handler.hm_protocol.handle_message.assert_called_once_with(
         message, handler.client)
+
+
+def test_hotpath_logger_delegates_configuration_to_host_runtime():
+    logger = websocket_protocol._log
+
+    assert logger is logging.getLogger(websocket_protocol.__name__)
+    assert logger.level == 0
+    assert logger.handlers == []
+    assert logger.propagate is True
 
 
 def test_request_summary_redacts_authorization_query():
