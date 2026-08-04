@@ -222,11 +222,25 @@ def _write_websocket_message(handler: WebSocketHandler,
                              completion: Optional[Future] = None) -> Future:
     """Write a frame and observe both synchronous and future failures."""
     completion = completion or Future()
+    if completion.done():
+        return completion
     try:
         future = handler.write_message(payload, is_binary)
-    except (WebSocketClosedError, StreamClosedError) as error:
+    except Exception as error:  # noqa: BLE001
+        # Tornado usually reports transport errors through its returned
+        # Future, but custom handlers and serialization failures may raise
+        # synchronously.  Complete the public send contract for every normal
+        # failure so a caller never waits forever on an orphaned Future.
         completion.set_exception(error)
-        LOG.debug("HiveMind websocket closed before a frame could be queued")
+        if isinstance(error, (WebSocketClosedError, StreamClosedError)):
+            LOG.debug(
+                "HiveMind websocket closed before a frame could be queued"
+            )
+        else:
+            LOG.error(
+                "HiveMind websocket write failed before queueing: "
+                f"{type(error).__name__}: {error!r}"
+            )
         return completion
     if future is not None:
         future.add_done_callback(

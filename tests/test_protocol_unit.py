@@ -113,6 +113,37 @@ def test_synchronous_closed_websocket_write_is_routine():
     handler.write_message.assert_called_once_with("payload", False)
 
 
+def test_synchronous_websocket_write_failure_completes_send_contract(
+        monkeypatch):
+    """A direct write error must not leave the returned Future unresolved."""
+    handler = SimpleNamespace(
+        write_message=Mock(side_effect=RuntimeError("serialization failed")),
+    )
+    logged = []
+    monkeypatch.setattr(websocket_protocol.LOG, "error", logged.append)
+
+    completion = _write_websocket_message(handler, "payload", False)
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        completion.result(timeout=0.1)
+    assert len(logged) == 1
+    assert "RuntimeError" in logged[0]
+
+
+def test_canceled_websocket_write_is_not_queued():
+    """Do not deliver an abandoned frame after its callback was scheduled."""
+    handler = SimpleNamespace(write_message=Mock())
+    completion = Future()
+    assert completion.cancel()
+
+    returned = _write_websocket_message(
+        handler, "payload", False, completion
+    )
+
+    assert returned is completion
+    handler.write_message.assert_not_called()
+
+
 def test_websocket_write_completion_tracks_tornado_future():
     tornado_future = Future()
     handler = SimpleNamespace(write_message=Mock(return_value=tornado_future))
