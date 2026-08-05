@@ -929,7 +929,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 if inbound_executor is None:
                     # Embedded harness compatibility; production run() always
                     # installs the bounded executor.
-                        self._process_inbound_message(message, received_at)
+                    self._process_inbound_message(message, received_at)
                 else:
                     await self.loop.run_in_executor(
                         inbound_executor,
