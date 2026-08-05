@@ -44,6 +44,9 @@ When inactive, `remote_ip` from the Tornado request is used as-is.
 | `disconnect_executor_workers` | `HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS` | `1` | Ordered workers for disconnect lifecycle callbacks; keep at `1` unless the callback chain is proven thread-safe. |
 | `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `true` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. Clients without a crypto key still receive full password validation. Set `false` only for a legacy client that explicitly requires password validation at listener admission. |
 | `slow_admission_log_ms` | `HIVEMIND_WEBSOCKET_SLOW_ADMISSION_LOG_MS` | `500` | Emit credential-free stage timings when WebSocket application admission exceeds this threshold. Set `0` to trace every admission. |
+| `metrics_enabled` | `HIVEMIND_WEBSOCKET_METRICS_ENABLED` | `false` | Start a dedicated plain-HTTP Prometheus listener. |
+| `metrics_host` | `HIVEMIND_WEBSOCKET_METRICS_HOST` | `127.0.0.1` | Metrics bind address. Use `0.0.0.0` for pod-network scraping. |
+| `metrics_port` | `HIVEMIND_WEBSOCKET_METRICS_PORT` | WebSocket port + 1 | Metrics port; it must differ from the WebSocket listener port. |
 
 Invalid, negative, non-finite, or non-positive values fall back to the
 applicable defaults.

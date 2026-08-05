@@ -59,6 +59,10 @@ from hivemind_websocket_protocol._metrics import (
     REDIS_COMMAND,
     REDIS_DESERIALIZE,
 )
+from hivemind_websocket_protocol._prometheus import (
+    HiveMindMetricsHandler,
+    load_metric_collectors,
+)
 
 
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
@@ -74,6 +78,7 @@ DEFAULT_PREFER_PRESHARED_KEY = True
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
 DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS = 16
 DEFAULT_SLOW_ADMISSION_LOG_MS = 500.0
+DEFAULT_METRICS_HOST = "127.0.0.1"
 
 
 _HANDSHAKE_TEMPLATE_CACHE: Dict[
@@ -363,6 +368,41 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             "slow_admission_log_ms",
         )
 
+    def _metrics_listener_settings(
+        self,
+        websocket_port: int,
+    ) -> Optional[Tuple[str, int]]:
+        enabled = _boolean(
+            self.config.get(
+                "metrics_enabled",
+                os.getenv("HIVEMIND_WEBSOCKET_METRICS_ENABLED"),
+            ),
+            False,
+            "metrics_enabled",
+        )
+        if not enabled:
+            return None
+        host = str(
+            self.config.get(
+                "metrics_host",
+                os.getenv("HIVEMIND_WEBSOCKET_METRICS_HOST"),
+            )
+            or DEFAULT_METRICS_HOST
+        )
+        port = _positive_int(
+            self.config.get(
+                "metrics_port",
+                os.getenv("HIVEMIND_WEBSOCKET_METRICS_PORT"),
+            ),
+            websocket_port + 1,
+            "metrics_port",
+        )
+        if port == websocket_port:
+            raise ValueError(
+                "metrics_port must differ from the websocket listener port"
+            )
+        return host, port
+
     def _auth_executor_settings(self) -> Tuple[int, int]:
         """Return bounded authorization worker and waiting-queue sizes."""
         workers = _positive_int(
@@ -520,6 +560,12 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         host = self.config.get("host") or self.identity.default_master or "0.0.0.0"
         host = host.split("://")[-1]
         port = int(self.config.get("port") or self.identity.default_port or 5678)
+        metrics_listener = self._metrics_listener_settings(port)
+        metrics_collectors = (
+            load_metric_collectors()
+            if metrics_listener is not None
+            else ()
+        )
 
         routes: list = [("/", HiveMindTornadoWebSocket)]
         websocket_ping_settings = self._websocket_ping_settings()
@@ -529,6 +575,18 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             trusted_headers=trusted_headers,
             **websocket_ping_settings,
         )
+        metrics_application = (
+            web.Application([
+                (
+                    r"/metrics",
+                    HiveMindMetricsHandler,
+                    {"collectors": metrics_collectors},
+                ),
+            ])
+            if metrics_listener is not None
+            else None
+        )
+        servers = []
         startup_error: Optional[Exception] = None
 
         def start_listener() -> None:
@@ -546,11 +604,26 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                     LOG.debug("using ssl certificate at " + cert_file)
                     ssl_options = {"certfile": cert_file, "keyfile": key_file}
 
-                    application.listen(port, host, ssl_options=ssl_options)
+                    servers.append(application.listen(
+                        port,
+                        host,
+                        ssl_options=ssl_options,
+                    ))
                     LOG.info("wss listener started")
                 else:
-                    application.listen(port, host)
+                    servers.append(application.listen(port, host))
                     LOG.info("ws listener started")
+                if metrics_listener is not None:
+                    metrics_host, metrics_port = metrics_listener
+                    servers.append(metrics_application.listen(
+                        metrics_port,
+                        metrics_host,
+                    ))
+                    LOG.info(
+                        "metrics listener started on %s:%s",
+                        metrics_host,
+                        metrics_port,
+                    )
             except Exception as error:
                 startup_error = error
                 LOG.exception("failed to start websocket listener")
@@ -560,6 +633,8 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         try:
             loop.start()  # blocking
         finally:
+            for server in servers:
+                server.stop()
             HiveMindTornadoWebSocket.auth_executor = None
             HiveMindTornadoWebSocket.auth_slots = None
             HiveMindTornadoWebSocket.auth_admission_capacity = None

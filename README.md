@@ -118,9 +118,18 @@ export HIVEMIND_TRUSTED_CLIENT_IP_HEADERS="x-forwarded-for"
 | `disconnect_executor_workers` | `HIVEMIND_WEBSOCKET_DISCONNECT_EXECUTOR_WORKERS` | `1` | Ordered workers for disconnect lifecycle callbacks. |
 | `prefer_preshared_key` | `HIVEMIND_WEBSOCKET_PREFER_PRESHARED_KEY` | `true` | When both credentials exist, prefer the high-entropy pre-shared crypto key and skip redundant password-strength analysis while retaining the compatibility handshake advertisement. Set `false` only for legacy password-validation behavior. |
 | `slow_admission_log_ms` | `HIVEMIND_WEBSOCKET_SLOW_ADMISSION_LOG_MS` | `500` | Emit credential-free stage timings for slow WebSocket application admission. |
+| `metrics_enabled` | `HIVEMIND_WEBSOCKET_METRICS_ENABLED` | `false` | Start the dedicated plain-HTTP Prometheus listener. |
+| `metrics_host` | `HIVEMIND_WEBSOCKET_METRICS_HOST` | `127.0.0.1` | Metrics bind address. Set `0.0.0.0` only when pod-network scraping is intended. |
+| `metrics_port` | `HIVEMIND_WEBSOCKET_METRICS_PORT` | WebSocket port + 1 | Metrics listener port; it must differ from the WebSocket port. |
 
 Both `trusted_proxy_cidrs` and `trusted_client_ip_headers` accept a string, list, or
 tuple. The feature is disabled unless at least one CIDR is configured.
+
+When metrics are enabled, `GET /metrics` exports standard Prometheus cumulative
+histograms in seconds. HiveMind packages contribute process-local collectors
+through the `hivemind.performance.metrics` entry-point group. Prometheus adds
+pod and shard labels during discovery, so aggregate percentiles must sum bucket
+rates by `le` before calling `histogram_quantile`.
 
 ## Docs
 

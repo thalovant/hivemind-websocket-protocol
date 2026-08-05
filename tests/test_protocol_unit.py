@@ -1024,6 +1024,25 @@ def test_slow_admission_log_threshold_config_overrides_env(monkeypatch):
     )._slow_admission_log_ms() == 250.0
 
 
+def test_metrics_listener_is_opt_in_and_configurable(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
+    assert proto._metrics_listener_settings(5678) is None
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_METRICS_ENABLED", "true")
+    assert proto._metrics_listener_settings(5678) == ("127.0.0.1", 5679)
+    assert HiveMindWebsocketProtocol(config={
+        "metrics_enabled": True,
+        "metrics_host": "0.0.0.0",
+        "metrics_port": 9464,
+    })._metrics_listener_settings(5678) == ("0.0.0.0", 9464)
+
+    with pytest.raises(ValueError, match="must differ"):
+        HiveMindWebsocketProtocol(config={
+            "metrics_enabled": True,
+            "metrics_port": 5678,
+        })._metrics_listener_settings(5678)
+
+
 def test_inbound_executor_settings_default_and_config_overrides_env(monkeypatch):
     proto = HiveMindWebsocketProtocol(config={})
     assert proto._inbound_executor_settings() == (
@@ -1564,6 +1583,64 @@ def test_run_starts_and_serves_on_plain_ws():
 
     t.join(timeout=5)
     assert not t.is_alive(), "run() did not return after ioloop.stop()"
+
+
+def test_run_starts_opt_in_metrics_listener():
+    """The dedicated HTTP listener exposes process-local Prometheus data."""
+    master = MasterNode.create("MM", require_crypto=False, handshake_enabled=True)
+    websocket_port = _free_port()
+    metrics_port = _free_port()
+    proto = HiveMindWebsocketProtocol(
+        config={
+            "host": "127.0.0.1",
+            "port": websocket_port,
+            "ssl": False,
+            "metrics_enabled": True,
+            "metrics_host": "127.0.0.1",
+            "metrics_port": metrics_port,
+        },
+        hm_protocol=master.hm_protocol,
+    )
+    if hasattr(HiveMindTornadoWebSocket, "loop"):
+        del HiveMindTornadoWebSocket.loop
+
+    thread = threading.Thread(target=proto.run, daemon=True)
+    thread.start()
+    response = b""
+    loop = None
+    try:
+        for _ in range(200):
+            loop = getattr(HiveMindTornadoWebSocket, "loop", None)
+            sock = socket.socket()
+            try:
+                sock.settimeout(0.25)
+                sock.connect(("127.0.0.1", metrics_port))
+                sock.sendall(
+                    b"GET /metrics HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                break
+            except OSError:
+                time.sleep(0.025)
+            finally:
+                sock.close()
+        else:
+            raise AssertionError("metrics listener did not start")
+
+        assert b"200 OK" in response
+        assert b"hivemind_admission_queue_seconds_count" in response
+    finally:
+        if loop is not None:
+            loop.add_callback(loop.stop)
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
 
 
 def test_run_raises_when_listener_bind_fails():
