@@ -166,8 +166,35 @@ def test_canceled_websocket_write_is_not_queued(open_handler):
     callback, args, kwargs = scheduled.pop()
     returned = callback(*args, **kwargs)
 
-    assert returned is completion
+    # The scheduler callback deliberately owns no awaitable; Tornado must not
+    # turn a routine close race into an unhandled callback exception.
+    assert returned is None
     handler.write_message.assert_not_called()
+
+
+def test_scheduled_websocket_write_does_not_leak_completion(open_handler):
+    """Tornado must not observe a late closed-socket write as callback work."""
+    scheduled = []
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: _auth_user()),
+        seen_clients=[],
+    )
+    handler.loop = SimpleNamespace(
+        add_callback=lambda callback, *args, **kwargs: scheduled.append(
+            (callback, args, kwargs)
+        )
+    )
+    handler.write_message = Mock(side_effect=WebSocketClosedError())
+    handler.event_loop_thread_id = None
+
+    _run_open(handler)
+    completion = handler.client.send_msg("payload", False)
+    assert len(scheduled) == 1
+
+    callback, args, kwargs = scheduled.pop()
+    assert callback(*args, **kwargs) is None
+    with pytest.raises(WebSocketClosedError):
+        completion.result(timeout=0.1)
 
 
 def test_websocket_write_completion_tracks_tornado_future():

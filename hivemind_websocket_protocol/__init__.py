@@ -1094,16 +1094,19 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
 
         def do_send(payload: str, is_bin: bool):
             completion = Future()
-            if self.event_loop_thread_id == get_ident():
+
+            def _write() -> None:
+                # IOLoop.add_callback observes an awaitable returned by its
+                # callback.  Returning ``completion`` here would therefore
+                # make a routine close race escape through Tornado as an
+                # unhandled WebSocketClosedError.  The transport Future is
+                # still chained to ``completion`` for callers that retain it.
                 _write_websocket_message(self, payload, is_bin, completion)
+
+            if self.event_loop_thread_id == get_ident():
+                _write()
             else:
-                self.loop.add_callback(
-                    _write_websocket_message,
-                    self,
-                    payload,
-                    is_bin,
-                    completion,
-                )
+                self.loop.add_callback(_write)
             return completion
 
         def do_disconnect():
