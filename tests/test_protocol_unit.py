@@ -383,6 +383,43 @@ def test_close_cancels_queued_inbound_work():
     handled.assert_not_called()
 
 
+def test_on_message_releases_the_semaphore_it_acquired():
+    original_slots = None
+    replacement_slots = None
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="client",
+        decode=lambda payload: SimpleNamespace(
+            msg_type=websocket_protocol.HiveMessageType.HANDSHAKE,
+            payload=payload,
+        ),
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=lambda *_: None)
+
+    async def replace_executor_state(_executor, callback, *args):
+        handler.inbound_slots = replacement_slots
+        handler.inbound_executor = None
+        callback(*args)
+
+    handler.loop = SimpleNamespace(run_in_executor=replace_executor_state)
+
+    async def run_message():
+        nonlocal original_slots, replacement_slots
+        original_slots = asyncio.BoundedSemaphore(1)
+        replacement_slots = asyncio.BoundedSemaphore(1)
+        handler.inbound_slots = original_slots
+        handler.inbound_executor = object()
+        await handler.on_message("payload")
+
+    asyncio.run(run_message())
+
+    assert original_slots is not None
+    assert replacement_slots is not None
+    assert original_slots._value == 1
+    assert replacement_slots._value == 1
+
+
 def test_on_message_logs_type_without_formatting_payload(monkeypatch):
     sentinel = "private user utterance"
     message = SimpleNamespace(

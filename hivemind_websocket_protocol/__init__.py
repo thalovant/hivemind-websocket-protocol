@@ -837,6 +837,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         task = asyncio.current_task()
         if task is not None:
             self._inbound_tasks.add(task)
+        inbound_slots = self.inbound_slots
+        inbound_executor = self.inbound_executor
         acquired = False
         try:
             # asyncio.Lock is FIFO, preserving Noise and application frame
@@ -844,18 +846,18 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             async with self._inbound_lock:
                 if self._inbound_closed:
                     return
-                if self.inbound_slots is not None:
-                    await self.inbound_slots.acquire()
+                if inbound_slots is not None:
+                    await inbound_slots.acquire()
                     acquired = True
                 if self._inbound_closed:
                     return
-                if self.inbound_executor is None:
+                if inbound_executor is None:
                     # Embedded harness compatibility; production run() always
                     # installs the bounded executor.
-                    self._process_inbound_message(message, received_at)
+                        self._process_inbound_message(message, received_at)
                 else:
                     await self.loop.run_in_executor(
-                        self.inbound_executor,
+                        inbound_executor,
                         self._process_inbound_message,
                         message,
                         received_at,
@@ -864,8 +866,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             if not self._inbound_closed:
                 raise
         finally:
-            if acquired and self.inbound_slots is not None:
-                self.inbound_slots.release()
+            if acquired and inbound_slots is not None:
+                inbound_slots.release()
             if task is not None:
                 self._inbound_tasks.discard(task)
             self._release_inbound_admission()
