@@ -47,7 +47,6 @@ When inactive, `remote_ip` from the Tornado request is used as-is.
 | `metrics_enabled` | `HIVEMIND_WEBSOCKET_METRICS_ENABLED` | `false` | Start a dedicated plain-HTTP Prometheus listener. |
 | `metrics_host` | `HIVEMIND_WEBSOCKET_METRICS_HOST` | `127.0.0.1` | Metrics bind address. Use `0.0.0.0` for pod-network scraping. |
 | `metrics_port` | `HIVEMIND_WEBSOCKET_METRICS_PORT` | WebSocket port + 1 | Metrics port; it must differ from the WebSocket listener port. |
-| n/a | `HIVEMIND_PERFORMANCE_TRACE` | `false` | Emit opt-in request-correlated `listener_receive` and Core transport-completion timestamps to structured logs. Request IDs are never metric labels. |
 
 Invalid, negative, non-finite, or non-positive values fall back to the
 applicable defaults.
