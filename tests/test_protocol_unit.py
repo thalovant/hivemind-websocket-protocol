@@ -501,11 +501,17 @@ def test_inbound_trace_uses_socket_receive_timestamp(monkeypatch):
         lambda stage, **values: traces.append((stage, values)),
     )
 
-    handler._process_inbound_message("payload", 10.0, 123_456_789)
+    handler._process_inbound_message(
+        "payload", 10.0, 123_456_789, 987_654_321
+    )
 
     assert traces == [(
         "listener_receive",
-        {"message": message, "at_unix_ns": 123_456_789},
+        {
+            "message": message,
+            "at_unix_ns": 123_456_789,
+            "at_monotonic_ns": 987_654_321,
+        },
     )]
 
 

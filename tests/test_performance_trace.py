@@ -22,11 +22,13 @@ def test_trace_emits_bounded_diagnostic_event(monkeypatch):
         "listener_receive",
         request_id="r" * 300,
         at_unix_ns=123_456_789,
+        at_monotonic_ns=987_654_321,
     )
 
     info.assert_called_once()
     event = json.loads(info.call_args.args[1])
     assert event == {
+        "at_monotonic_ns": 987_654_321,
         "at_unix_ns": 123_456_789,
         "request_id": "r" * 256,
         "stage": "listener_receive",

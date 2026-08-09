@@ -72,6 +72,7 @@ def trace_performance_stage(
     message: Any = None,
     request_id: str | None = None,
     at_unix_ns: int | None = None,
+    at_monotonic_ns: int | None = None,
 ) -> None:
     """Log one timestamped stage for an explicitly correlated request."""
     if not performance_trace_enabled():
@@ -80,6 +81,10 @@ def trace_performance_stage(
     if not identifier:
         return
     event = {
+        "at_monotonic_ns": int(
+            at_monotonic_ns if at_monotonic_ns is not None
+            else time.monotonic_ns()
+        ),
         "at_unix_ns": int(
             at_unix_ns if at_unix_ns is not None else time.time_ns()
         ),

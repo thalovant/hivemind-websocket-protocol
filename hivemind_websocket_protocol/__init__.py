@@ -867,7 +867,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
 
     def _process_inbound_message(self, raw_message: str,
                                  received_at: float,
-                                 received_at_unix_ns: int) -> None:
+                                 received_at_unix_ns: int,
+                                 received_at_monotonic_ns: int) -> None:
         """Decode and dispatch one ordered frame away from Tornado's IOLoop."""
         if self._inbound_closed:
             return
@@ -886,6 +887,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 "listener_receive",
                 message=message,
                 at_unix_ns=received_at_unix_ns,
+                at_monotonic_ns=received_at_monotonic_ns,
             )
             peer = self._peer_label(self.client.peer)
             if (
@@ -910,6 +912,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             return
         received_at = time.monotonic()
         received_at_unix_ns = time.time_ns()
+        received_at_monotonic_ns = time.monotonic_ns()
         if not self._reserve_inbound_admission():
             LOG.warning(
                 "Rejecting websocket message because inbound processing is "
@@ -943,6 +946,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                         message,
                         received_at,
                         received_at_unix_ns,
+                        received_at_monotonic_ns,
                     )
                 else:
                     await self.loop.run_in_executor(
@@ -951,6 +955,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                         message,
                         received_at,
                         received_at_unix_ns,
+                        received_at_monotonic_ns,
                     )
         except asyncio.CancelledError:
             if not self._inbound_closed:
