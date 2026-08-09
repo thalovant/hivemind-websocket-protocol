@@ -1,4 +1,5 @@
 import pytest
+from threading import get_ident
 from tornado import web
 from tornado.testing import AsyncHTTPTestCase
 
@@ -38,6 +39,15 @@ def test_prometheus_renderer_converts_milliseconds_to_seconds():
     assert "hivemind_bus_write_seconds_count 2" in payload
 
 
+def test_prometheus_renderer_preserves_full_sum_precision():
+    snapshots = _collector()
+    snapshots["hivemind_bus_write_ms"]["sum_ms"] = 1_234_567_800.0
+
+    payload = render_prometheus(snapshots)
+
+    assert "hivemind_bus_write_seconds_sum 1234567.8" in payload
+
+
 def test_collectors_must_not_publish_duplicate_metrics():
     collectors = (("first", _collector), ("second", _collector))
 
@@ -72,15 +82,22 @@ def test_metric_collectors_are_discovered_through_explicit_entry_points(
 
 class TestPrometheusMetricsEndpoint(AsyncHTTPTestCase):
     def get_app(self):
+        self.collector_threads = []
+
+        def collector():
+            self.collector_threads.append(get_ident())
+            return _collector()
+
         return web.Application([
             (
                 r"/metrics",
                 HiveMindMetricsHandler,
-                {"collectors": (("test", _collector),)},
+                {"collectors": (("test", collector),)},
             ),
         ])
 
     def test_get_returns_prometheus_text_without_caching(self):
+        event_loop_thread = get_ident()
         response = self.fetch("/metrics")
 
         assert response.code == 200
@@ -89,3 +106,5 @@ class TestPrometheusMetricsEndpoint(AsyncHTTPTestCase):
             "text/plain; version=0.0.4"
         )
         assert b"hivemind_bus_write_seconds_count 2" in response.body
+        assert self.collector_threads
+        assert self.collector_threads[0] != event_loop_thread

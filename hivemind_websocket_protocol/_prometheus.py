@@ -9,7 +9,7 @@ from importlib import metadata
 from typing import Any
 
 from ovos_utils.log import LOG
-from tornado import web
+from tornado import ioloop, web
 
 from hivemind_websocket_protocol._metrics import performance_histograms
 
@@ -146,7 +146,7 @@ def render_prometheus(
                 f"{bucket_count}"
             )
         lines.append(f'{exported}_bucket{{le="+Inf"}} {count}')
-        lines.append(f"{exported}_sum {sum_seconds:g}")
+        lines.append(f"{exported}_sum {sum_seconds!r}")
         lines.append(f"{exported}_count {count}")
     return "\n".join(lines) + "\n"
 
@@ -160,9 +160,14 @@ class HiveMindMetricsHandler(web.RequestHandler):
     ) -> None:
         self.collectors = tuple(collectors)
 
-    def get(self) -> None:
+    async def get(self) -> None:
         try:
-            payload = render_prometheus(collect_histograms(self.collectors))
+            payload = await ioloop.IOLoop.current().run_in_executor(
+                None,
+                lambda: render_prometheus(
+                    collect_histograms(self.collectors)
+                ),
+            )
         except Exception as error:
             LOG.exception("HiveMind metrics scrape failed")
             raise web.HTTPError(500, reason="metrics collection failed") from error

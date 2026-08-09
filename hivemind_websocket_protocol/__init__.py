@@ -15,7 +15,7 @@ from os import makedirs
 from os.path import exists, join
 from socket import gethostname
 from threading import Lock, get_ident
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 import pybase64
 from hivemind_bus_client.message import HiveMessageType
@@ -82,13 +82,13 @@ DEFAULT_SLOW_ADMISSION_LOG_MS = 500.0
 DEFAULT_METRICS_HOST = "127.0.0.1"
 
 
-_HANDSHAKE_TEMPLATE_CACHE: Dict[
+_HANDSHAKE_TEMPLATE_CACHE: dict[
     str,
-    Tuple[Tuple[str, int, int, int, int], HandShake],
+    tuple[tuple[str, int, int, int, int], HandShake],
 ] = {}
 _HANDSHAKE_TEMPLATE_LOCK = Lock()
 _PASSWORD_STRENGTH_LOCK = Lock()
-_PASSWORD_STRENGTH_CACHE: "OrderedDict[Tuple[bytes, float], None]" = OrderedDict()
+_PASSWORD_STRENGTH_CACHE: OrderedDict[tuple[bytes, float], None] = OrderedDict()
 _PASSWORD_STRENGTH_CACHE_KEY = os.urandom(32)
 _PASSWORD_STRENGTH_CACHE_SIZE = 4096
 
@@ -98,7 +98,9 @@ _PASSWORD_STRENGTH_CACHE_SIZE = 4096
 _log = logging.getLogger(__name__)
 
 
-def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
+def _private_key_fingerprint(
+    path: Optional[str],
+) -> Optional[tuple[str, int, int, int, int]]:
     """Return a cheap rotation-aware fingerprint for a listener private key."""
     if not path or not os.path.isfile(path):
         return None
@@ -262,7 +264,7 @@ def _write_websocket_message(handler: WebSocketHandler,
     return completion
 
 
-def _split_csv(value: Any) -> Tuple[str, ...]:
+def _split_csv(value: Any) -> tuple[str, ...]:
     if not value:
         return ()
     if isinstance(value, str):
@@ -323,11 +325,11 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
     Attributes:
         hm_protocol (Optional[HiveMindListenerProtocol]): The protocol instance for handling HiveMind messages.
     """
-    config: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    config: dict[str, Any] = dataclasses.field(default_factory=dict)
     hm_protocol: Optional[HiveMindListenerProtocol] = None
     callbacks: ClientCallbacks = dataclasses.field(default_factory=ClientCallbacks)
 
-    def _websocket_ping_settings(self) -> Dict[str, float]:
+    def _websocket_ping_settings(self) -> dict[str, float]:
         interval = self.config.get(
             "websocket_ping_interval",
             os.getenv("HIVEMIND_WEBSOCKET_PING_INTERVAL"),
@@ -372,7 +374,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
     def _metrics_listener_settings(
         self,
         websocket_port: int,
-    ) -> Optional[Tuple[str, int]]:
+    ) -> Optional[tuple[str, int]]:
         enabled = _boolean(
             self.config.get(
                 "metrics_enabled",
@@ -404,7 +406,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             )
         return host, port
 
-    def _auth_executor_settings(self) -> Tuple[int, int]:
+    def _auth_executor_settings(self) -> tuple[int, int]:
         """Return bounded authorization worker and waiting-queue sizes."""
         workers = _positive_int(
             self.config.get(
@@ -424,7 +426,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         )
         return workers, queue_size
 
-    def _inbound_executor_settings(self) -> Tuple[int, int, int]:
+    def _inbound_executor_settings(self) -> tuple[int, int, int]:
         """Return bounded inbound worker, global queue, and client queue sizes."""
         workers = _positive_int(
             self.config.get(
@@ -668,7 +670,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
     def create_self_signed_cert(
             cert_dir: str = f"{xdg_data_home()}/hivemind",
             name: str = "hivemind"
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         """
         Create a self-signed certificate and key pair if they do not already exist.
 
@@ -804,7 +806,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         )
 
     @staticmethod
-    def decode_auth(auth: str) -> Tuple[str, str]:
+    def decode_auth(auth: str) -> tuple[str, str]:
         """
         Decode the base64 encoded authorization string.
 
@@ -1025,7 +1027,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             type(self).auth_pending = max(0, type(self).auth_pending - 1)
 
     async def _lookup_client_by_api_key(
-            self, key: str) -> Tuple[Optional[Client], Dict[str, float]]:
+            self, key: str) -> tuple[Optional[Client], dict[str, float]]:
         """Keep remote credential I/O off Tornado's single event-loop thread."""
         database = self.hm_protocol.db
         backend = getattr(database, "db", database)
