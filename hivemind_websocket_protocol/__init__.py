@@ -39,7 +39,6 @@ except ImportError:  # released hivemind-core without the helper
         ).strip().lower()
         return 0.0 if disabled in ("1", "true", "yes", "on") else 40.0
 
-from hivemind_core.performance import trace_performance_stage
 from hivemind_core.protocol import (
     HiveMindClientConnection,
     HiveMindListenerProtocol,
@@ -58,6 +57,9 @@ from hivemind_websocket_protocol._metrics import (
     INBOUND_QUEUE,
     REDIS_COMMAND,
     REDIS_DESERIALIZE,
+)
+from hivemind_websocket_protocol._performance_trace import (
+    trace_performance_stage,
 )
 from hivemind_websocket_protocol._prometheus import (
     HiveMindMetricsHandler,
