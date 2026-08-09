@@ -13,23 +13,22 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from os import makedirs
 from os.path import exists, join
-from threading import Lock, get_ident
 from socket import gethostname
-from typing import Dict, Any, Optional, Tuple
+from threading import Lock, get_ident
+from typing import Any, Dict, Optional, Tuple
 
 import pybase64
-from OpenSSL import crypto
+from hivemind_bus_client.message import HiveMessageType
 from hivemind_plugin_manager.protocols import NetworkProtocol
+from OpenSSL import crypto
 from ovos_bus_client.session import Session
 from ovos_utils.log import LOG
 from ovos_utils.xdg_utils import xdg_data_home
 from poorman_handshake import HandShake, PasswordHandShake, check_password_strength
-from tornado import ioloop
-from tornado import web
+from tornado import ioloop, web
 from tornado.iostream import StreamClosedError
 from tornado.websocket import WebSocketClosedError, WebSocketHandler
 
-from hivemind_bus_client.message import HiveMessageType
 try:
     from hivemind_core.config import runtime_password_min_bits
 except ImportError:  # released hivemind-core without the helper
@@ -40,13 +39,14 @@ except ImportError:  # released hivemind-core without the helper
         ).strip().lower()
         return 0.0 if disabled in ("1", "true", "yes", "on") else 40.0
 
+from hivemind_core.performance import trace_performance_stage
 from hivemind_core.protocol import (
-    HiveMindListenerProtocol,
     HiveMindClientConnection,
-    HiveMindNodeType
+    HiveMindListenerProtocol,
+    HiveMindNodeType,
 )
-from hivemind_plugin_manager.protocols import ClientCallbacks
 from hivemind_plugin_manager.database import AbstractRemoteDB, Client
+from hivemind_plugin_manager.protocols import ClientCallbacks
 
 from hivemind_websocket_protocol._client_ip import (
     parse_networks,
@@ -63,7 +63,6 @@ from hivemind_websocket_protocol._prometheus import (
     HiveMindMetricsHandler,
     load_metric_collectors,
 )
-
 
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
@@ -863,7 +862,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             self._inbound_pending = max(0, self._inbound_pending - 1)
 
     def _process_inbound_message(self, raw_message: str,
-                                 received_at: float) -> None:
+                                 received_at: float,
+                                 received_at_unix_ns: int) -> None:
         """Decode and dispatch one ordered frame away from Tornado's IOLoop."""
         if self._inbound_closed:
             return
@@ -878,6 +878,11 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             if message.msg_type == HiveMessageType.HELLO:
                 self._remember_hello_session(message)
             message = self._hydrate_bus_session(message)
+            trace_performance_stage(
+                "listener_receive",
+                message=message,
+                at_unix_ns=received_at_unix_ns,
+            )
             peer = self._peer_label(self.client.peer)
             if (
                     message.msg_type == HiveMessageType.BUS
@@ -900,6 +905,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         if self._inbound_closed:
             return
         received_at = time.monotonic()
+        received_at_unix_ns = time.time_ns()
         if not self._reserve_inbound_admission():
             LOG.warning(
                 "Rejecting websocket message because inbound processing is "
@@ -929,13 +935,18 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 if inbound_executor is None:
                     # Embedded harness compatibility; production run() always
                     # installs the bounded executor.
-                    self._process_inbound_message(message, received_at)
+                    self._process_inbound_message(
+                        message,
+                        received_at,
+                        received_at_unix_ns,
+                    )
                 else:
                     await self.loop.run_in_executor(
                         inbound_executor,
                         self._process_inbound_message,
                         message,
                         received_at,
+                        received_at_unix_ns,
                     )
         except asyncio.CancelledError:
             if not self._inbound_closed:

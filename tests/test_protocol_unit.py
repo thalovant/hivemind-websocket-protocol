@@ -478,6 +478,37 @@ def test_on_message_logs_type_without_formatting_payload(monkeypatch):
         message, handler.client)
 
 
+def test_inbound_trace_uses_socket_receive_timestamp(monkeypatch):
+    traces = []
+    message = SimpleNamespace(
+        msg_type=websocket_protocol.HiveMessageType.BUS,
+        payload=SimpleNamespace(
+            msg_type="recognizer_loop:utterance",
+            context={"query_id": "request-inbound"},
+        ),
+    )
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler._inbound_closed = False
+    handler.client = SimpleNamespace(
+        peer="trace-client",
+        sess=SimpleNamespace(serialize=dict),
+        decode=lambda _payload: message,
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=lambda *_args: None)
+    monkeypatch.setattr(
+        websocket_protocol,
+        "trace_performance_stage",
+        lambda stage, **values: traces.append((stage, values)),
+    )
+
+    handler._process_inbound_message("payload", 10.0, 123_456_789)
+
+    assert traces == [(
+        "listener_receive",
+        {"message": message, "at_unix_ns": 123_456_789},
+    )]
+
+
 def test_hotpath_logger_delegates_configuration_to_host_runtime():
     logger = websocket_protocol._log
 
