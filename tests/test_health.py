@@ -6,7 +6,7 @@ import pytest
 from tornado import web
 from tornado.testing import AsyncHTTPTestCase
 
-from hivemind_websocket_protocol._health import (
+from hivemind_websocket_protocol.health import (
     LOCAL_HEALTH_PATH,
     HiveMindWebApplication,
     LocalHealthHandler,

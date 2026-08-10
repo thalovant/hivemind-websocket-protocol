@@ -29,16 +29,7 @@ from tornado import ioloop, web
 from tornado.iostream import StreamClosedError
 from tornado.websocket import WebSocketClosedError, WebSocketHandler
 
-try:
-    from hivemind_core.config import runtime_password_min_bits
-except ImportError:  # released hivemind-core without the helper
-    def runtime_password_min_bits():
-        disabled = os.environ.get(
-            "HIVEMIND_DISABLE_PASSWORD_STRENGTH_CHECK",
-            "",
-        ).strip().lower()
-        return 0.0 if disabled in ("1", "true", "yes", "on") else 40.0
-
+from hivemind_core.config import runtime_password_min_bits
 from hivemind_core.protocol import (
     HiveMindClientConnection,
     HiveMindListenerProtocol,
@@ -51,7 +42,7 @@ from hivemind_websocket_protocol._client_ip import (
     parse_networks,
     resolve_client_ip,
 )
-from hivemind_websocket_protocol._health import (
+from hivemind_websocket_protocol.health import (
     LOCAL_HEALTH_PATH,
     HiveMindWebApplication,
     LocalHealthHandler,

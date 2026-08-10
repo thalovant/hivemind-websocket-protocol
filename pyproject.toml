@@ -15,7 +15,7 @@ dependencies = [
     "tornado",
     "hivemind-plugin-manager>=0.8.0a1,<1.0.0",
     "poorman-handshake>=2.0.0a1,<3.0.0",
-    "hivemind-core>=4.10.2a2,<5.0.0",
+    "hivemind-core>=4.10.2a8,<5.0.0",
     "pyOpenSSL",
     "pybase64",
 ]
