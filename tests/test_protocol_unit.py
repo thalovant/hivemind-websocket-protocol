@@ -13,6 +13,7 @@ import socket
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from http.client import HTTPConnection
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call
@@ -1595,7 +1596,7 @@ def _free_port() -> int:
 
 
 def test_run_starts_and_serves_on_plain_ws():
-    """Calling proto.run() binds and services a real websocket upgrade."""
+    """Calling proto.run() serves both WebSocket and local health paths."""
     master = MasterNode.create("MX", require_crypto=False, handshake_enabled=True)
     port = _free_port()
     proto = HiveMindWebsocketProtocol(
@@ -1641,6 +1642,15 @@ def test_run_starts_and_serves_on_plain_ws():
             b"Sec-WebSocket-Version: 13\r\n\r\n"
         )
         assert b"101 Switching Protocols" in s.recv(512)
+
+        connection = HTTPConnection("127.0.0.1", port, timeout=1)
+        try:
+            connection.request("GET", "/_healthz")
+            response = connection.getresponse()
+            assert response.status == 204
+            assert response.read() == b""
+        finally:
+            connection.close()
     finally:
         s.close()
         loop.add_callback(loop.stop)

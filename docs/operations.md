@@ -1,5 +1,14 @@
 # Operations
 
+## Listener liveness
+
+The WebSocket listener serves `GET /_healthz` only to IPv4 or IPv6 loopback
+clients. A successful request returns `204 No Content` and proves that the
+listener's Tornado IOLoop can accept and dispatch work without creating an
+unauthenticated WebSocket session. Successful probes are excluded from access
+logs. Use an in-container request rather than exposing this endpoint through a
+public load balancer.
+
 ## TLS setup
 
 ### Auto-generated self-signed cert (development / internal use)

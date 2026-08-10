@@ -51,6 +51,11 @@ from hivemind_websocket_protocol._client_ip import (
     parse_networks,
     resolve_client_ip,
 )
+from hivemind_websocket_protocol._health import (
+    LOCAL_HEALTH_PATH,
+    HiveMindWebApplication,
+    LocalHealthHandler,
+)
 from hivemind_websocket_protocol._metrics import (
     ADMISSION_QUEUE,
     INBOUND_PROCESSING,
@@ -570,9 +575,12 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             else ()
         )
 
-        routes: list = [("/", HiveMindTornadoWebSocket)]
+        routes: list = [
+            (LOCAL_HEALTH_PATH, LocalHealthHandler),
+            ("/", HiveMindTornadoWebSocket),
+        ]
         websocket_ping_settings = self._websocket_ping_settings()
-        application = web.Application(
+        application = HiveMindWebApplication(
             routes,
             trusted_networks=trusted_networks,
             trusted_headers=trusted_headers,
