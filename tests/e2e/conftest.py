@@ -33,7 +33,13 @@ def hive():
 
     Yields `(master, satellite)` for the standard M0/S0 pair.
     """
-    builder = single_satellite()
+    # Core's client model has a bus-message whitelist but no per-bin_type
+    # grants. Its binary policy admits frames only when that whitelist is
+    # non-empty, so keep one least-privilege bus topic instead of pretending
+    # binary payload enum values are bus message types.
+    builder = single_satellite(
+        allowed_types=["recognizer_loop:utterance"],
+    )
     try:
         builder.start_all()
         yield builder.get_master("M0"), builder.get_satellite("S0")

@@ -7,6 +7,7 @@ Targets:
 - version.py module loading.
 """
 import asyncio
+import logging
 import os
 import socket
 import threading
@@ -19,18 +20,23 @@ from unittest.mock import Mock, call
 import pybase64
 import pytest
 from hivemind_plugin_manager.database import AbstractRemoteDB
+from hivescope.node import MasterNode
 from tornado.websocket import WebSocketClosedError
 
+import hivemind_websocket_protocol as websocket_protocol
 from hivemind_websocket_protocol import (
+    _HANDSHAKE_TEMPLATE_CACHE,
+    _PASSWORD_STRENGTH_CACHE,
     DEFAULT_AUTH_EXECUTOR_WORKERS,
     DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS,
     DEFAULT_DISCONNECT_EXECUTOR_WORKERS,
     DEFAULT_HANDSHAKE_EXECUTOR_WORKERS,
+    DEFAULT_INBOUND_CLIENT_QUEUE_SIZE,
+    DEFAULT_INBOUND_EXECUTOR_WORKERS,
+    DEFAULT_INBOUND_QUEUE_SIZE,
     DEFAULT_SLOW_ADMISSION_LOG_MS,
     DEFAULT_WEBSOCKET_PING_INTERVAL,
     DEFAULT_WEBSOCKET_PING_TIMEOUT,
-    _HANDSHAKE_TEMPLATE_CACHE,
-    _PASSWORD_STRENGTH_CACHE,
     HiveMindTornadoWebSocket,
     HiveMindWebsocketProtocol,
     _finish_disconnect_callback,
@@ -40,17 +46,29 @@ from hivemind_websocket_protocol import (
     _refresh_local_client_database,
     _write_websocket_message,
 )
-import hivemind_websocket_protocol as websocket_protocol
-from hivescope.node import MasterNode
 
 
 @pytest.fixture(autouse=True)
 def _reset_websocket_sync_state():
     HiveMindTornadoWebSocket._last_sync_ts = 0.0
     HiveMindTornadoWebSocket._last_sync_error = None
+    HiveMindTornadoWebSocket.auth_admission_capacity = None
+    HiveMindTornadoWebSocket.auth_pending = 0
+    HiveMindTornadoWebSocket.inbound_executor = None
+    HiveMindTornadoWebSocket.inbound_slots = None
+    HiveMindTornadoWebSocket.inbound_admission_capacity = None
+    HiveMindTornadoWebSocket.inbound_client_queue_size = None
+    HiveMindTornadoWebSocket.inbound_pending = 0
     _PASSWORD_STRENGTH_CACHE.clear()
     yield
     _PASSWORD_STRENGTH_CACHE.clear()
+    HiveMindTornadoWebSocket.auth_admission_capacity = None
+    HiveMindTornadoWebSocket.auth_pending = 0
+    HiveMindTornadoWebSocket.inbound_executor = None
+    HiveMindTornadoWebSocket.inbound_slots = None
+    HiveMindTornadoWebSocket.inbound_admission_capacity = None
+    HiveMindTornadoWebSocket.inbound_client_queue_size = None
+    HiveMindTornadoWebSocket.inbound_pending = 0
 
 
 # --- version.py module load ------------------------------------------------
@@ -108,6 +126,152 @@ def test_synchronous_closed_websocket_write_is_routine():
     handler.write_message.assert_called_once_with("payload", False)
 
 
+def test_synchronous_websocket_write_failure_completes_send_contract(
+        monkeypatch):
+    """A direct write error must not leave the returned Future unresolved."""
+    handler = SimpleNamespace(
+        write_message=Mock(side_effect=RuntimeError("serialization failed")),
+    )
+    logged = []
+    monkeypatch.setattr(websocket_protocol.LOG, "error", logged.append)
+
+    completion = _write_websocket_message(handler, "payload", False)
+
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        completion.result(timeout=0.1)
+    assert len(logged) == 1
+    assert "RuntimeError" in logged[0]
+
+
+def test_canceled_websocket_write_is_not_queued(open_handler):
+    """Do not deliver a frame canceled after the public send scheduled it."""
+    scheduled = []
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: _auth_user()),
+        seen_clients=[],
+    )
+    handler.loop = SimpleNamespace(
+        add_callback=lambda callback, *args, **kwargs: scheduled.append(
+            (callback, args, kwargs)
+        )
+    )
+    handler.write_message = Mock()
+    handler.event_loop_thread_id = None
+
+    _run_open(handler)
+    completion = handler.client.send_msg("payload", False)
+    assert len(scheduled) == 1
+    assert completion.cancel()
+
+    callback, args, kwargs = scheduled.pop()
+    returned = callback(*args, **kwargs)
+
+    # The scheduler callback deliberately owns no awaitable; Tornado must not
+    # turn a routine close race into an unhandled callback exception.
+    assert returned is None
+    handler.write_message.assert_not_called()
+
+
+def test_scheduled_websocket_write_does_not_leak_completion(open_handler):
+    """Tornado must not observe a late closed-socket write as callback work."""
+    scheduled = []
+    handler = open_handler(
+        SimpleNamespace(get_client_by_api_key=lambda key: _auth_user()),
+        seen_clients=[],
+    )
+    handler.loop = SimpleNamespace(
+        add_callback=lambda callback, *args, **kwargs: scheduled.append(
+            (callback, args, kwargs)
+        )
+    )
+    handler.write_message = Mock(side_effect=WebSocketClosedError())
+    handler.event_loop_thread_id = None
+
+    _run_open(handler)
+    completion = handler.client.send_msg("payload", False)
+    assert len(scheduled) == 1
+
+    callback, args, kwargs = scheduled.pop()
+    assert callback(*args, **kwargs) is None
+    with pytest.raises(WebSocketClosedError):
+        completion.result(timeout=0.1)
+
+
+def test_websocket_write_completion_tracks_tornado_future():
+    tornado_future = Future()
+    handler = SimpleNamespace(write_message=Mock(return_value=tornado_future))
+
+    completion = _write_websocket_message(handler, "payload", False)
+    assert not completion.done()
+
+    tornado_future.set_result(None)
+    assert completion.result(timeout=0.1) is None
+
+
+def test_authorization_admission_is_strictly_bounded():
+    HiveMindTornadoWebSocket.auth_admission_capacity = 2
+    handlers = [
+        HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+        for _ in range(3)
+    ]
+    for handler in handlers:
+        handler._auth_admission_reserved = False
+
+    assert handlers[0]._reserve_auth_admission() is True
+    assert handlers[1]._reserve_auth_admission() is True
+    assert handlers[2]._reserve_auth_admission() is False
+    assert HiveMindTornadoWebSocket.auth_pending == 2
+
+    handlers[0]._release_auth_admission()
+    assert handlers[2]._reserve_auth_admission() is True
+    assert HiveMindTornadoWebSocket.auth_pending == 2
+
+    handlers[1]._release_auth_admission()
+    handlers[2]._release_auth_admission()
+    HiveMindTornadoWebSocket.auth_admission_capacity = None
+
+
+def test_inbound_admission_is_bounded_globally_and_per_client():
+    HiveMindTornadoWebSocket.inbound_admission_capacity = 3
+    HiveMindTornadoWebSocket.inbound_client_queue_size = 2
+    first = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    second = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+
+    assert first._reserve_inbound_admission() is True
+    assert first._reserve_inbound_admission() is True
+    assert first._reserve_inbound_admission() is False
+    assert second._reserve_inbound_admission() is True
+    assert second._reserve_inbound_admission() is False
+    assert HiveMindTornadoWebSocket.inbound_pending == 3
+
+    first._release_inbound_admission()
+    assert second._reserve_inbound_admission() is True
+    assert HiveMindTornadoWebSocket.inbound_pending == 3
+
+    first._release_inbound_admission()
+    second._release_inbound_admission()
+    second._release_inbound_admission()
+    assert HiveMindTornadoWebSocket.inbound_pending == 0
+
+
+def test_inbound_overload_closes_only_the_owning_socket():
+    HiveMindTornadoWebSocket.inbound_admission_capacity = 1
+    HiveMindTornadoWebSocket.inbound_client_queue_size = 1
+    blocker = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.close = Mock()
+
+    assert blocker._reserve_inbound_admission() is True
+    asyncio.run(handler.on_message("payload"))
+
+    handler.close.assert_called_once_with(
+        code=1013,
+        reason="inbound processing overloaded",
+    )
+    assert blocker._inbound_closed is False
+    blocker._release_inbound_admission()
+
+
 def test_disconnect_callback_failures_are_observed(monkeypatch):
     logged = []
     future = Future()
@@ -120,7 +284,7 @@ def test_disconnect_callback_failures_are_observed(monkeypatch):
     assert "RuntimeError" in logged[0]
 
 
-def test_password_handshakes_are_processed_concurrently_off_event_loop():
+def test_messages_from_different_clients_run_concurrently_off_event_loop():
     handled = []
 
     def slow_handshake(message, client):
@@ -150,15 +314,177 @@ def test_password_handshakes_are_processed_concurrently_off_event_loop():
         )
         handlers.append(handler)
 
-    async def run_all():
-        await asyncio.gather(*(handler.on_message("payload") for handler in handlers))
+    executor = ThreadPoolExecutor(max_workers=8)
 
-    started = time.monotonic()
-    asyncio.run(run_all())
-    elapsed = time.monotonic() - started
+    async def run_all():
+        slots = asyncio.Semaphore(8)
+        for handler in handlers:
+            handler.inbound_executor = executor
+            handler.inbound_slots = slots
+        started = time.monotonic()
+        await asyncio.gather(*(
+            handler.on_message("payload") for handler in handlers
+        ))
+        return time.monotonic() - started
+
+    try:
+        elapsed = asyncio.run(run_all())
+    finally:
+        executor.shutdown(wait=True)
 
     assert elapsed < 0.25
     assert len(handled) == 8
+
+
+def test_messages_from_one_client_preserve_receive_order():
+    handled = []
+    executor = ThreadPoolExecutor(max_workers=4)
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="ordered-client",
+        decode=lambda payload: SimpleNamespace(
+            msg_type=websocket_protocol.HiveMessageType.HANDSHAKE,
+            payload=payload,
+        ),
+    )
+    handler.hm_protocol = SimpleNamespace(
+        handle_message=lambda message, _client: handled.append(message.payload),
+    )
+    handler.loop = SimpleNamespace(
+        run_in_executor=lambda selected, callback, *args: (
+            asyncio.get_running_loop().run_in_executor(
+                selected,
+                callback,
+                *args,
+            )
+        ),
+    )
+    handler.inbound_executor = executor
+
+    async def run_all():
+        handler.inbound_slots = asyncio.Semaphore(4)
+        await asyncio.gather(*(
+            handler.on_message(payload) for payload in ("one", "two", "three")
+        ))
+
+    try:
+        asyncio.run(run_all())
+    finally:
+        executor.shutdown(wait=True)
+
+    assert handled == ["one", "two", "three"]
+
+
+def test_close_cancels_queued_inbound_work():
+    handled = Mock()
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="closing-client",
+        decode=Mock(),
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=handled)
+    handler.request = SimpleNamespace(remote_ip="127.0.0.1")
+    handler._auth_lookup_future = None
+    handler._auth_task = None
+    handler._auth_admission_reserved = False
+    handler._client_admitted = False
+
+    async def close_while_queued():
+        handler._ensure_inbound_state()
+        await handler._inbound_lock.acquire()
+        task = asyncio.create_task(handler.on_message("queued"))
+        await asyncio.sleep(0)
+        assert handler._inbound_pending == 1
+        handler.on_close()
+        handler._inbound_lock.release()
+        await task
+
+    asyncio.run(close_while_queued())
+
+    assert handler._inbound_closed is True
+    assert handler._inbound_pending == 0
+    assert HiveMindTornadoWebSocket.inbound_pending == 0
+    handler.client.decode.assert_not_called()
+    handled.assert_not_called()
+
+
+def test_on_message_releases_the_semaphore_it_acquired():
+    original_slots = None
+    replacement_slots = None
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="client",
+        decode=lambda payload: SimpleNamespace(
+            msg_type=websocket_protocol.HiveMessageType.HANDSHAKE,
+            payload=payload,
+        ),
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=lambda *_: None)
+
+    async def replace_executor_state(_executor, callback, *args):
+        handler.inbound_slots = replacement_slots
+        handler.inbound_executor = None
+        callback(*args)
+
+    handler.loop = SimpleNamespace(run_in_executor=replace_executor_state)
+
+    async def run_message():
+        nonlocal original_slots, replacement_slots
+        original_slots = asyncio.BoundedSemaphore(1)
+        replacement_slots = asyncio.BoundedSemaphore(1)
+        handler.inbound_slots = original_slots
+        handler.inbound_executor = object()
+        await handler.on_message("payload")
+
+    asyncio.run(run_message())
+
+    assert original_slots is not None
+    assert replacement_slots is not None
+    assert original_slots._value == 1
+    assert replacement_slots._value == 1
+
+
+def test_on_message_logs_type_without_formatting_payload(monkeypatch):
+    sentinel = "private user utterance"
+    message = SimpleNamespace(
+        msg_type=websocket_protocol.HiveMessageType.BUS,
+        payload=SimpleNamespace(
+            msg_type="intent",
+            context={"utterance": sentinel},
+        ),
+    )
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.source_ip = None
+    handler.client = SimpleNamespace(
+        peer="client-1",
+        decode=lambda _payload: message,
+    )
+    handler.hm_protocol = SimpleNamespace(handle_message=Mock())
+    debug = Mock()
+    monkeypatch.setattr(websocket_protocol._log, "debug", debug)
+
+    asyncio.run(handler.on_message("wire payload"))
+
+    debug.assert_called_once_with(
+        "Received %s message: %s",
+        "client-1",
+        websocket_protocol.HiveMessageType.BUS,
+    )
+    assert sentinel not in repr(debug.call_args)
+    handler.hm_protocol.handle_message.assert_called_once_with(
+        message, handler.client)
+
+
+def test_hotpath_logger_delegates_configuration_to_host_runtime():
+    logger = websocket_protocol._log
+
+    assert logger is logging.getLogger(websocket_protocol.__name__)
+    assert logger.level == 0
+    assert logger.handlers == []
+    assert logger.propagate is True
 
 
 def test_request_summary_redacts_authorization_query():
@@ -428,7 +754,7 @@ def _open_handler(db, key="api-key", seen_clients=None,
         {"args": args, "kwargs": kwargs}
     )
     handler.get_query_argument = lambda name, default=None: pybase64.b64encode(
-        f"agent:{key}".encode("utf-8")
+        f"agent:{key}".encode()
     ).decode("ascii")
     return handler
 
@@ -725,6 +1051,44 @@ def test_slow_admission_log_threshold_config_overrides_env(monkeypatch):
     )._slow_admission_log_ms() == 250.0
 
 
+def test_metrics_listener_is_opt_in_and_configurable(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
+    assert proto._metrics_listener_settings(5678) is None
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_METRICS_ENABLED", "true")
+    assert proto._metrics_listener_settings(5678) == ("127.0.0.1", 5679)
+    assert HiveMindWebsocketProtocol(config={
+        "metrics_enabled": True,
+        "metrics_host": "0.0.0.0",
+        "metrics_port": 9464,
+    })._metrics_listener_settings(5678) == ("0.0.0.0", 9464)
+
+    with pytest.raises(ValueError, match="must differ"):
+        HiveMindWebsocketProtocol(config={
+            "metrics_enabled": True,
+            "metrics_port": 5678,
+        })._metrics_listener_settings(5678)
+
+
+def test_inbound_executor_settings_default_and_config_overrides_env(monkeypatch):
+    proto = HiveMindWebsocketProtocol(config={})
+    assert proto._inbound_executor_settings() == (
+        DEFAULT_INBOUND_EXECUTOR_WORKERS,
+        DEFAULT_INBOUND_QUEUE_SIZE,
+        DEFAULT_INBOUND_CLIENT_QUEUE_SIZE,
+    )
+
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_INBOUND_EXECUTOR_WORKERS", "8")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_INBOUND_QUEUE_SIZE", "512")
+    monkeypatch.setenv("HIVEMIND_WEBSOCKET_INBOUND_CLIENT_QUEUE_SIZE", "32")
+    assert proto._inbound_executor_settings() == (8, 512, 32)
+    assert HiveMindWebsocketProtocol(config={
+        "inbound_executor_workers": 12,
+        "inbound_queue_size": 768,
+        "inbound_client_queue_size": 48,
+    })._inbound_executor_settings() == (12, 768, 48)
+
+
 def test_open_isolates_remote_auth_from_password_handshake(open_handler, monkeypatch):
     user = _auth_user()
     user.password = "strong-machine-secret"
@@ -790,6 +1154,9 @@ def test_open_uses_startup_password_policy_snapshot(open_handler, monkeypatch):
 def test_executor_worker_defaults_cover_guarded_admission_burst():
     assert DEFAULT_AUTH_EXECUTOR_WORKERS >= 50
     assert DEFAULT_HANDSHAKE_EXECUTOR_WORKERS >= 25
+    assert DEFAULT_INBOUND_EXECUTOR_WORKERS >= 8
+    assert DEFAULT_INBOUND_QUEUE_SIZE >= 400
+    assert DEFAULT_INBOUND_CLIENT_QUEUE_SIZE >= 16
     assert DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS >= 8
     assert DEFAULT_DISCONNECT_EXECUTOR_WORKERS == 1
 
@@ -930,6 +1297,7 @@ def test_cached_protocol_burst_avoids_executor_completion_queue(
         for _ in range(8)
     ]
     lifecycle_executor = ThreadPoolExecutor(max_workers=8)
+    lifecycle_barrier = threading.Barrier(9)
 
     def cached_protocol(client):
         client.send_msg("handshake-frame", False)
@@ -938,20 +1306,20 @@ def test_cached_protocol_burst_avoids_executor_completion_queue(
     for handler in handlers:
         handler.hm_protocol.handle_new_client_protocol = Mock(return_value=True)
         handler.hm_protocol.handle_new_client_protocol_cached = cached_protocol
-        handler.hm_protocol.handle_client_connected = Mock()
+        handler.hm_protocol.handle_client_connected = (
+            lambda _client: lifecycle_barrier.wait(timeout=1)
+        )
         handler.connect_lifecycle_executor = lifecycle_executor
 
     async def run_all():
         await asyncio.gather(*(handler.open() for handler in handlers))
 
     try:
-        started = time.monotonic()
         asyncio.run(run_all())
-        elapsed = time.monotonic() - started
+        lifecycle_barrier.wait(timeout=1)
     finally:
+        lifecycle_barrier.abort()
         lifecycle_executor.shutdown(wait=True)
-
-    assert elapsed < 0.1
 
 
 def test_close_waits_for_matching_connect_lifecycle(open_handler):
@@ -1055,6 +1423,24 @@ def test_close_retains_embedded_handler_fallback_without_executor():
     handler.on_close()
 
     assert disconnected == [handler.client]
+
+
+def test_close_cancels_abandoned_authorization_work():
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    auth_lookup = Mock()
+    auth_lookup.done.return_value = False
+    auth_task = Mock()
+    auth_task.done.return_value = False
+    handler._auth_lookup_future = auth_lookup
+    handler._auth_task = auth_task
+    handler._auth_admission_reserved = False
+    handler._client_admitted = False
+    handler.request = SimpleNamespace(remote_ip="127.0.0.1")
+
+    handler.on_close()
+
+    auth_lookup.cancel.assert_called_once_with()
+    auth_task.cancel.assert_called_once_with()
 
 
 def test_open_fails_closed_when_remote_lookup_raises(open_handler):
@@ -1226,6 +1612,64 @@ def test_run_starts_and_serves_on_plain_ws():
     assert not t.is_alive(), "run() did not return after ioloop.stop()"
 
 
+def test_run_starts_opt_in_metrics_listener():
+    """The dedicated HTTP listener exposes process-local Prometheus data."""
+    master = MasterNode.create("MM", require_crypto=False, handshake_enabled=True)
+    websocket_port = _free_port()
+    metrics_port = _free_port()
+    proto = HiveMindWebsocketProtocol(
+        config={
+            "host": "127.0.0.1",
+            "port": websocket_port,
+            "ssl": False,
+            "metrics_enabled": True,
+            "metrics_host": "127.0.0.1",
+            "metrics_port": metrics_port,
+        },
+        hm_protocol=master.hm_protocol,
+    )
+    if hasattr(HiveMindTornadoWebSocket, "loop"):
+        del HiveMindTornadoWebSocket.loop
+
+    thread = threading.Thread(target=proto.run, daemon=True)
+    thread.start()
+    response = b""
+    loop = None
+    try:
+        for _ in range(200):
+            loop = getattr(HiveMindTornadoWebSocket, "loop", None)
+            sock = socket.socket()
+            try:
+                sock.settimeout(0.25)
+                sock.connect(("127.0.0.1", metrics_port))
+                sock.sendall(
+                    b"GET /metrics HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                break
+            except OSError:
+                time.sleep(0.025)
+            finally:
+                sock.close()
+        else:
+            raise AssertionError("metrics listener did not start")
+
+        assert b"200 OK" in response
+        assert b"hivemind_admission_queue_seconds_count" in response
+    finally:
+        if loop is not None:
+            loop.add_callback(loop.stop)
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
 def test_run_raises_when_listener_bind_fails():
     """Bind failures propagate instead of looking like clean exits."""
     master = MasterNode.create("MF", require_crypto=False, handshake_enabled=True)
@@ -1249,7 +1693,7 @@ def test_run_raises_when_listener_bind_fails():
 
 def test_run_ssl_path_uses_existing_cert(tmp_path):
     """SSL branch in run(): existing cert is picked up; no regeneration."""
-    cert, key = HiveMindWebsocketProtocol.create_self_signed_cert(
+    _cert, _key = HiveMindWebsocketProtocol.create_self_signed_cert(
         cert_dir=str(tmp_path), name="ssl-test"
     )
     master = MasterNode.create("MS", require_crypto=False, handshake_enabled=True)

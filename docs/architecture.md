@@ -43,9 +43,13 @@ manages one WebSocket connection per instance.
 
 ### `on_message()`
 
-Decodes the raw WebSocket frame via `client.decode()`, then dispatches to
-`hm_protocol.handle_message(message, client)`. Binary audio frames
-(`recognizer_loop:b64_audio` inside a `BUS` message) are logged separately.
+Reserves bounded global and per-client capacity, then decodes and dispatches the
+frame on the shared inbound executor. A FIFO `asyncio.Lock` on each connection
+preserves Noise and application ordering for that client while unrelated
+clients run concurrently. Global or per-client overload closes only the owning
+socket with retryable close code `1013`; closing a socket cancels its queued
+tasks. Binary audio frames (`recognizer_loop:b64_audio` inside a `BUS` message)
+are logged separately.
 
 ### `on_close()`
 

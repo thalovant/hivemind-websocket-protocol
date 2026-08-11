@@ -3,18 +3,19 @@ import binascii
 import copy
 import dataclasses
 import hashlib
+import logging
 import math
 import os
 import os.path
 import random
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from os import makedirs
 from os.path import exists, join
-from threading import Lock, get_ident
 from socket import gethostname
-from typing import Dict, Any, Optional, Tuple
+from threading import Lock, get_ident
+from typing import Any, Optional
 
 import pybase64
 from OpenSSL import crypto
@@ -51,31 +52,54 @@ from hivemind_websocket_protocol._client_ip import (
     parse_networks,
     resolve_client_ip,
 )
+from hivemind_websocket_protocol._metrics import (
+    ADMISSION_QUEUE,
+    INBOUND_PROCESSING,
+    INBOUND_QUEUE,
+    REDIS_COMMAND,
+    REDIS_DESERIALIZE,
+)
+from hivemind_websocket_protocol._prometheus import (
+    HiveMindMetricsHandler,
+    load_metric_collectors,
+)
 
 
 DEFAULT_TRUSTED_HEADERS = "x-hivemind-client-ip,x-forwarded-for,x-real-ip"
 DEFAULT_WEBSOCKET_PING_INTERVAL = 30.0
 DEFAULT_WEBSOCKET_PING_TIMEOUT = 20.0
 DEFAULT_AUTH_EXECUTOR_WORKERS = 64
+DEFAULT_AUTH_QUEUE_SIZE = 64
 DEFAULT_HANDSHAKE_EXECUTOR_WORKERS = 32
+DEFAULT_INBOUND_EXECUTOR_WORKERS = 16
+DEFAULT_INBOUND_QUEUE_SIZE = 1024
+DEFAULT_INBOUND_CLIENT_QUEUE_SIZE = 64
 DEFAULT_PREFER_PRESHARED_KEY = True
 DEFAULT_DISCONNECT_EXECUTOR_WORKERS = 1
 DEFAULT_CONNECT_LIFECYCLE_EXECUTOR_WORKERS = 16
 DEFAULT_SLOW_ADMISSION_LOG_MS = 500.0
+DEFAULT_METRICS_HOST = "127.0.0.1"
 
 
-_HANDSHAKE_TEMPLATE_CACHE: Dict[
+_HANDSHAKE_TEMPLATE_CACHE: dict[
     str,
-    Tuple[Tuple[str, int, int, int, int], HandShake],
+    tuple[tuple[str, int, int, int, int], HandShake],
 ] = {}
 _HANDSHAKE_TEMPLATE_LOCK = Lock()
 _PASSWORD_STRENGTH_LOCK = Lock()
-_PASSWORD_STRENGTH_CACHE: "OrderedDict[Tuple[bytes, float], None]" = OrderedDict()
+_PASSWORD_STRENGTH_CACHE: OrderedDict[tuple[bytes, float], None] = OrderedDict()
 _PASSWORD_STRENGTH_CACHE_KEY = os.urandom(32)
 _PASSWORD_STRENGTH_CACHE_SIZE = 4096
 
+# The websocket receive path runs on Tornado's single IOLoop. OVOS LOG.debug
+# resolves caller metadata with inspect.stack() even when DEBUG is disabled;
+# stdlib logging checks the level first and supports lazy argument formatting.
+_log = logging.getLogger(__name__)
 
-def _private_key_fingerprint(path: Optional[str]) -> Optional[Tuple[str, int, int, int, int]]:
+
+def _private_key_fingerprint(
+    path: Optional[str],
+) -> Optional[tuple[str, int, int, int, int]]:
     """Return a cheap rotation-aware fingerprint for a listener private key."""
     if not path or not os.path.isfile(path):
         return None
@@ -148,13 +172,22 @@ def _refresh_local_client_database(database: Any) -> bool:
     return True
 
 
-def _finish_websocket_write(future: Any) -> None:
+def _finish_websocket_write(future: Any,
+                            completion: Optional[Future] = None) -> None:
     """Consume asynchronous write failures so closed peers stay routine."""
+    if completion is None:
+        future.exception()
+        return
+    if completion.done():
+        return
     if future.cancelled():
+        completion.cancel()
         return
     error = future.exception()
     if error is None:
+        completion.set_result(None)
         return
+    completion.set_exception(error)
     if isinstance(error, (WebSocketClosedError, StreamClosedError)):
         LOG.debug("HiveMind websocket closed before a queued write completed")
         return
@@ -197,18 +230,40 @@ def _finish_connect_lifecycle(
 
 def _write_websocket_message(handler: WebSocketHandler,
                              payload: str,
-                             is_binary: bool) -> None:
+                             is_binary: bool,
+                             completion: Optional[Future] = None) -> Future:
     """Write a frame and observe both synchronous and future failures."""
+    completion = completion or Future()
+    if completion.done():
+        return completion
     try:
         future = handler.write_message(payload, is_binary)
-    except (WebSocketClosedError, StreamClosedError):
-        LOG.debug("HiveMind websocket closed before a frame could be queued")
-        return
+    except Exception as error:  # noqa: BLE001
+        # Tornado usually reports transport errors through its returned
+        # Future, but custom handlers and serialization failures may raise
+        # synchronously.  Complete the public send contract for every normal
+        # failure so a caller never waits forever on an orphaned Future.
+        completion.set_exception(error)
+        if isinstance(error, (WebSocketClosedError, StreamClosedError)):
+            LOG.debug(
+                "HiveMind websocket closed before a frame could be queued"
+            )
+        else:
+            LOG.error(
+                "HiveMind websocket write failed before queueing: "
+                f"{type(error).__name__}: {error!r}"
+            )
+        return completion
     if future is not None:
-        future.add_done_callback(_finish_websocket_write)
+        future.add_done_callback(
+            lambda pending: _finish_websocket_write(pending, completion)
+        )
+    else:
+        completion.set_result(None)
+    return completion
 
 
-def _split_csv(value: Any) -> Tuple[str, ...]:
+def _split_csv(value: Any) -> tuple[str, ...]:
     if not value:
         return ()
     if isinstance(value, str):
@@ -269,11 +324,11 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
     Attributes:
         hm_protocol (Optional[HiveMindListenerProtocol]): The protocol instance for handling HiveMind messages.
     """
-    config: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    config: dict[str, Any] = dataclasses.field(default_factory=dict)
     hm_protocol: Optional[HiveMindListenerProtocol] = None
     callbacks: ClientCallbacks = dataclasses.field(default_factory=ClientCallbacks)
 
-    def _websocket_ping_settings(self) -> Dict[str, float]:
+    def _websocket_ping_settings(self) -> dict[str, float]:
         interval = self.config.get(
             "websocket_ping_interval",
             os.getenv("HIVEMIND_WEBSOCKET_PING_INTERVAL"),
@@ -315,21 +370,103 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             "slow_admission_log_ms",
         )
 
+    def _metrics_listener_settings(
+        self,
+        websocket_port: int,
+    ) -> Optional[tuple[str, int]]:
+        enabled = _boolean(
+            self.config.get(
+                "metrics_enabled",
+                os.getenv("HIVEMIND_WEBSOCKET_METRICS_ENABLED"),
+            ),
+            False,
+            "metrics_enabled",
+        )
+        if not enabled:
+            return None
+        host = str(
+            self.config.get(
+                "metrics_host",
+                os.getenv("HIVEMIND_WEBSOCKET_METRICS_HOST"),
+            )
+            or DEFAULT_METRICS_HOST
+        )
+        port = _positive_int(
+            self.config.get(
+                "metrics_port",
+                os.getenv("HIVEMIND_WEBSOCKET_METRICS_PORT"),
+            ),
+            websocket_port + 1,
+            "metrics_port",
+        )
+        if port == websocket_port:
+            raise ValueError(
+                "metrics_port must differ from the websocket listener port"
+            )
+        return host, port
+
+    def _auth_executor_settings(self) -> tuple[int, int]:
+        """Return bounded authorization worker and waiting-queue sizes."""
+        workers = _positive_int(
+            self.config.get(
+                "auth_executor_workers",
+                os.getenv("HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS"),
+            ),
+            DEFAULT_AUTH_EXECUTOR_WORKERS,
+            "auth_executor_workers",
+        )
+        queue_size = _positive_int(
+            self.config.get(
+                "auth_queue_size",
+                os.getenv("HIVEMIND_WEBSOCKET_AUTH_QUEUE_SIZE"),
+            ),
+            DEFAULT_AUTH_QUEUE_SIZE,
+            "auth_queue_size",
+        )
+        return workers, queue_size
+
+    def _inbound_executor_settings(self) -> tuple[int, int, int]:
+        """Return bounded inbound worker, global queue, and client queue sizes."""
+        workers = _positive_int(
+            self.config.get(
+                "inbound_executor_workers",
+                os.getenv("HIVEMIND_WEBSOCKET_INBOUND_EXECUTOR_WORKERS"),
+            ),
+            DEFAULT_INBOUND_EXECUTOR_WORKERS,
+            "inbound_executor_workers",
+        )
+        queue_size = _positive_int(
+            self.config.get(
+                "inbound_queue_size",
+                os.getenv("HIVEMIND_WEBSOCKET_INBOUND_QUEUE_SIZE"),
+            ),
+            DEFAULT_INBOUND_QUEUE_SIZE,
+            "inbound_queue_size",
+        )
+        client_queue_size = _positive_int(
+            self.config.get(
+                "inbound_client_queue_size",
+                os.getenv("HIVEMIND_WEBSOCKET_INBOUND_CLIENT_QUEUE_SIZE"),
+            ),
+            DEFAULT_INBOUND_CLIENT_QUEUE_SIZE,
+            "inbound_client_queue_size",
+        )
+        return workers, queue_size, client_queue_size
+
     def run(self):
         LOG.debug(f"websocket server config: {self.config}")
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
         loop = ioloop.IOLoop.current()
         password_min_bits = runtime_password_min_bits()
+        auth_workers, auth_queue_size = self._auth_executor_settings()
+        (
+            inbound_workers,
+            inbound_queue_size,
+            inbound_client_queue_size,
+        ) = self._inbound_executor_settings()
         auth_executor = ThreadPoolExecutor(
-            max_workers=_positive_int(
-                self.config.get(
-                    "auth_executor_workers",
-                    os.getenv("HIVEMIND_WEBSOCKET_AUTH_EXECUTOR_WORKERS"),
-                ),
-                DEFAULT_AUTH_EXECUTOR_WORKERS,
-                "auth_executor_workers",
-            ),
+            max_workers=auth_workers,
             thread_name_prefix="hivemind-wss-auth",
         )
         handshake_executor = ThreadPoolExecutor(
@@ -342,6 +479,10 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                 "handshake_executor_workers",
             ),
             thread_name_prefix="hivemind-wss-handshake",
+        )
+        inbound_executor = ThreadPoolExecutor(
+            max_workers=inbound_workers,
+            thread_name_prefix="hivemind-wss-inbound",
         )
         disconnect_executor = ThreadPoolExecutor(
             max_workers=_positive_int(
@@ -371,7 +512,23 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         HiveMindTornadoWebSocket.event_loop_thread_id = get_ident()
         HiveMindTornadoWebSocket.hm_protocol = self.hm_protocol
         HiveMindTornadoWebSocket.auth_executor = auth_executor
+        HiveMindTornadoWebSocket.auth_slots = asyncio.Semaphore(auth_workers)
+        HiveMindTornadoWebSocket.auth_admission_capacity = (
+            auth_workers + auth_queue_size
+        )
+        HiveMindTornadoWebSocket.auth_pending = 0
         HiveMindTornadoWebSocket.handshake_executor = handshake_executor
+        HiveMindTornadoWebSocket.inbound_executor = inbound_executor
+        HiveMindTornadoWebSocket.inbound_slots = asyncio.Semaphore(
+            inbound_workers
+        )
+        HiveMindTornadoWebSocket.inbound_admission_capacity = (
+            inbound_workers + inbound_queue_size
+        )
+        HiveMindTornadoWebSocket.inbound_client_queue_size = (
+            inbound_client_queue_size
+        )
+        HiveMindTornadoWebSocket.inbound_pending = 0
         HiveMindTornadoWebSocket.disconnect_executor = disconnect_executor
         HiveMindTornadoWebSocket.connect_lifecycle_executor = (
             connect_lifecycle_executor
@@ -405,6 +562,12 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         host = self.config.get("host") or self.identity.default_master or "0.0.0.0"
         host = host.split("://")[-1]
         port = int(self.config.get("port") or self.identity.default_port or 5678)
+        metrics_listener = self._metrics_listener_settings(port)
+        metrics_collectors = (
+            load_metric_collectors()
+            if metrics_listener is not None
+            else ()
+        )
 
         routes: list = [("/", HiveMindTornadoWebSocket)]
         websocket_ping_settings = self._websocket_ping_settings()
@@ -414,6 +577,18 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             trusted_headers=trusted_headers,
             **websocket_ping_settings,
         )
+        metrics_application = (
+            web.Application([
+                (
+                    r"/metrics",
+                    HiveMindMetricsHandler,
+                    {"collectors": metrics_collectors},
+                ),
+            ])
+            if metrics_listener is not None
+            else None
+        )
+        servers = []
         startup_error: Optional[Exception] = None
 
         def start_listener() -> None:
@@ -431,11 +606,26 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
                     LOG.debug("using ssl certificate at " + cert_file)
                     ssl_options = {"certfile": cert_file, "keyfile": key_file}
 
-                    application.listen(port, host, ssl_options=ssl_options)
+                    servers.append(application.listen(
+                        port,
+                        host,
+                        ssl_options=ssl_options,
+                    ))
                     LOG.info("wss listener started")
                 else:
-                    application.listen(port, host)
+                    servers.append(application.listen(port, host))
                     LOG.info("ws listener started")
+                if metrics_listener is not None:
+                    metrics_host, metrics_port = metrics_listener
+                    servers.append(metrics_application.listen(
+                        metrics_port,
+                        metrics_host,
+                    ))
+                    LOG.info(
+                        "metrics listener started on %s:%s",
+                        metrics_host,
+                        metrics_port,
+                    )
             except Exception as error:
                 startup_error = error
                 LOG.exception("failed to start websocket listener")
@@ -445,9 +635,19 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
         try:
             loop.start()  # blocking
         finally:
+            for server in servers:
+                server.stop()
             HiveMindTornadoWebSocket.auth_executor = None
+            HiveMindTornadoWebSocket.auth_slots = None
+            HiveMindTornadoWebSocket.auth_admission_capacity = None
+            HiveMindTornadoWebSocket.auth_pending = 0
             HiveMindTornadoWebSocket.event_loop_thread_id = None
             HiveMindTornadoWebSocket.handshake_executor = None
+            HiveMindTornadoWebSocket.inbound_executor = None
+            HiveMindTornadoWebSocket.inbound_slots = None
+            HiveMindTornadoWebSocket.inbound_admission_capacity = None
+            HiveMindTornadoWebSocket.inbound_client_queue_size = None
+            HiveMindTornadoWebSocket.inbound_pending = 0
             HiveMindTornadoWebSocket.disconnect_executor = None
             HiveMindTornadoWebSocket.connect_lifecycle_executor = None
             HiveMindTornadoWebSocket.password_min_bits = None
@@ -456,6 +656,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             )
             auth_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
+            inbound_executor.shutdown(wait=True, cancel_futures=True)
             connect_lifecycle_executor.shutdown(
                 wait=True,
                 cancel_futures=True,
@@ -468,7 +669,7 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
     def create_self_signed_cert(
             cert_dir: str = f"{xdg_data_home()}/hivemind",
             name: str = "hivemind"
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         """
         Create a self-signed certificate and key pair if they do not already exist.
 
@@ -520,8 +721,18 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     """
     hm_protocol = None
     auth_executor: Optional[ThreadPoolExecutor] = None
+    auth_slots: Optional[asyncio.Semaphore] = None
+    auth_admission_capacity: Optional[int] = None
+    auth_pending: int = 0
+    auth_pending_lock = Lock()
     event_loop_thread_id: Optional[int] = None
     handshake_executor: Optional[ThreadPoolExecutor] = None
+    inbound_executor: Optional[ThreadPoolExecutor] = None
+    inbound_slots: Optional[asyncio.Semaphore] = None
+    inbound_admission_capacity: Optional[int] = None
+    inbound_client_queue_size: Optional[int] = None
+    inbound_pending: int = 0
+    inbound_pending_lock = Lock()
     disconnect_executor: Optional[ThreadPoolExecutor] = None
     connect_lifecycle_executor: Optional[ThreadPoolExecutor] = None
     password_min_bits: Optional[float] = None
@@ -534,6 +745,10 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
     _sync_debounce_s = 1.0
     _connect_lifecycle_future: Optional[Any] = None
     _disconnect_submitted: bool = False
+    _auth_task: Optional[asyncio.Task] = None
+    _auth_lookup_future: Optional[Any] = None
+    _auth_admission_reserved: bool = False
+    _client_admitted: bool = False
 
     @staticmethod
     def _serialized_session(session: Any) -> dict[str, Any]:
@@ -590,7 +805,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         )
 
     @staticmethod
-    def decode_auth(auth: str) -> Tuple[str, str]:
+    def decode_auth(auth: str) -> tuple[str, str]:
         """
         Decode the base64 encoded authorization string.
 
@@ -613,30 +828,133 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             raise ValueError("invalid authorization payload")
         return name, key
 
-    async def on_message(self, message: str) -> None:
-        message = self.client.decode(message)
-        if message.msg_type == HiveMessageType.HELLO:
-            self._remember_hello_session(message)
-        message = self._hydrate_bus_session(message)
-        peer = self._peer_label(self.client.peer)
-        if (
-                message.msg_type == HiveMessageType.BUS
-                and message.payload.msg_type == "recognizer_loop:b64_audio"
-        ):
-            LOG.debug(f"Received {peer} sent base64 audio for STT")
-        else:
-            LOG.debug(f"Received {peer} message: {message}")
-        if message.msg_type == HiveMessageType.HANDSHAKE:
-            # Password-key derivation uses PBKDF2 and must not serialize every
-            # concurrent connection on Tornado's single event-loop thread.
-            await self.loop.run_in_executor(
-                self.handshake_executor,
-                self.hm_protocol.handle_message,
-                message,
-                self.client,
+    def _ensure_inbound_state(self) -> None:
+        """Initialize connection-local receive ordering for tests and runtimes."""
+        if not hasattr(self, "_inbound_lock"):
+            self._inbound_lock = asyncio.Lock()
+        if not hasattr(self, "_inbound_tasks"):
+            self._inbound_tasks = set()
+        if not hasattr(self, "_inbound_pending"):
+            self._inbound_pending = 0
+        if not hasattr(self, "_inbound_closed"):
+            self._inbound_closed = False
+
+    def _reserve_inbound_admission(self) -> bool:
+        """Bound global and per-client messages waiting for inbound workers."""
+        self._ensure_inbound_state()
+        global_capacity = self.inbound_admission_capacity
+        client_capacity = self.inbound_client_queue_size
+        with self.inbound_pending_lock:
+            if (global_capacity is not None
+                    and type(self).inbound_pending >= global_capacity):
+                return False
+            if (client_capacity is not None
+                    and self._inbound_pending >= client_capacity):
+                return False
+            type(self).inbound_pending += 1
+            self._inbound_pending += 1
+            return True
+
+    def _release_inbound_admission(self) -> None:
+        """Release one inbound queue reservation after completion/cancellation."""
+        with self.inbound_pending_lock:
+            type(self).inbound_pending = max(
+                0,
+                type(self).inbound_pending - 1,
             )
-        else:
+            self._inbound_pending = max(0, self._inbound_pending - 1)
+
+    def _process_inbound_message(self, raw_message: str,
+                                 received_at: float) -> None:
+        """Decode and dispatch one ordered frame away from Tornado's IOLoop."""
+        if self._inbound_closed:
+            return
+        processing_started = time.monotonic()
+        INBOUND_QUEUE.observe_ms(
+            (processing_started - received_at) * 1000
+        )
+        try:
+            message = self.client.decode(raw_message)
+            if self._inbound_closed:
+                return
+            if message.msg_type == HiveMessageType.HELLO:
+                self._remember_hello_session(message)
+            message = self._hydrate_bus_session(message)
+            peer = self._peer_label(self.client.peer)
+            if (
+                    message.msg_type == HiveMessageType.BUS
+                    and message.payload.msg_type == "recognizer_loop:b64_audio"
+            ):
+                _log.debug("Received %s sent base64 audio for STT", peer)
+            else:
+                # Never format the full payload here: beyond the serialization
+                # cost, BUS frames can contain a user's transcribed speech.
+                _log.debug("Received %s message: %s", peer, message.msg_type)
             self.hm_protocol.handle_message(message, self.client)
+        finally:
+            INBOUND_PROCESSING.observe_ms(
+                (time.monotonic() - processing_started) * 1000
+            )
+
+    async def on_message(self, message: str) -> None:
+        """Queue one frame without blocking Tornado's shared event loop."""
+        self._ensure_inbound_state()
+        if self._inbound_closed:
+            return
+        received_at = time.monotonic()
+        if not self._reserve_inbound_admission():
+            LOG.warning(
+                "Rejecting websocket message because inbound processing is "
+                "overloaded"
+            )
+            self._cancel_inbound_processing()
+            self.close(code=1013, reason="inbound processing overloaded")
+            return
+
+        task = asyncio.current_task()
+        if task is not None:
+            self._inbound_tasks.add(task)
+        inbound_slots = self.inbound_slots
+        inbound_executor = self.inbound_executor
+        acquired = False
+        try:
+            # asyncio.Lock is FIFO, preserving Noise and application frame
+            # ordering for one client while different clients run concurrently.
+            async with self._inbound_lock:
+                if self._inbound_closed:
+                    return
+                if inbound_slots is not None:
+                    await inbound_slots.acquire()
+                    acquired = True
+                if self._inbound_closed:
+                    return
+                if inbound_executor is None:
+                    # Embedded harness compatibility; production run() always
+                    # installs the bounded executor.
+                    self._process_inbound_message(message, received_at)
+                else:
+                    await self.loop.run_in_executor(
+                        inbound_executor,
+                        self._process_inbound_message,
+                        message,
+                        received_at,
+                    )
+        except asyncio.CancelledError:
+            if not self._inbound_closed:
+                raise
+        finally:
+            if acquired and inbound_slots is not None:
+                inbound_slots.release()
+            if task is not None:
+                self._inbound_tasks.discard(task)
+            self._release_inbound_admission()
+
+    def _cancel_inbound_processing(self) -> None:
+        """Cancel queued receive work when its owning socket closes."""
+        self._inbound_closed = True
+        for task in tuple(getattr(self, "_inbound_tasks", ())):
+            if not task.done():
+                task.cancel()
 
     def _peer_label(self, peer: str) -> str:
         return f"{peer} ({self.source_ip})" if self.source_ip else peer
@@ -672,23 +990,97 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             cls._last_sync_error = None
             return refreshed
 
-    async def _lookup_client_by_api_key(self, key: str) -> Optional[Client]:
+    def _reserve_auth_admission(self) -> bool:
+        """Reserve one running or queued authorization slot."""
+        capacity = self.auth_admission_capacity
+        if capacity is None:
+            self._auth_admission_reserved = True
+            return True
+        with self.auth_pending_lock:
+            if type(self).auth_pending >= capacity:
+                return False
+            type(self).auth_pending += 1
+            self._auth_admission_reserved = True
+            return True
+
+    def _release_auth_admission(self) -> None:
+        """Release a previously reserved authorization slot exactly once."""
+        if not self._auth_admission_reserved:
+            return
+        self._auth_admission_reserved = False
+        if self.auth_admission_capacity is None:
+            return
+        with self.auth_pending_lock:
+            type(self).auth_pending = max(0, type(self).auth_pending - 1)
+
+    async def _lookup_client_by_api_key(
+            self, key: str) -> tuple[Optional[Client], dict[str, float]]:
         """Keep remote credential I/O off Tornado's single event-loop thread."""
         database = self.hm_protocol.db
         backend = getattr(database, "db", database)
-        if isinstance(backend, AbstractRemoteDB):
-            return await self.loop.run_in_executor(
-                self.auth_executor,
-                database.get_client_by_api_key,
-                key,
+        try:
+            detailed_lookup = getattr(
+                database, "get_client_by_api_key_with_metrics", None
             )
-        return database.get_client_by_api_key(key)
+            lookup = (detailed_lookup if callable(detailed_lookup)
+                      else database.get_client_by_api_key)
+            if isinstance(backend, AbstractRemoteDB):
+                future = self.loop.run_in_executor(
+                    self.auth_executor,
+                    lookup,
+                    key,
+                )
+                self._auth_lookup_future = future
+                result = await future
+            else:
+                result = lookup(key)
+            if callable(detailed_lookup):
+                user, timings = result
+            else:
+                user, timings = result, {}
+            redis_command_ms = timings.get("redis_command_ms")
+            if redis_command_ms is not None:
+                REDIS_COMMAND.observe_ms(redis_command_ms)
+            redis_deserialize_ms = timings.get("redis_deserialize_ms")
+            if redis_deserialize_ms is not None:
+                REDIS_DESERIALIZE.observe_ms(redis_deserialize_ms)
+            return user, timings
+        finally:
+            self._auth_lookup_future = None
 
     async def open(self) -> None:
+        """Run one complete authorization inside the bounded admission gate."""
+        self._auth_task = asyncio.current_task()
+        self._auth_lookup_future = None
+        self._auth_admission_reserved = False
+        self._client_admitted = False
+        queue_started = time.monotonic()
+        acquired = False
+        if not self._reserve_auth_admission():
+            LOG.warning("Rejecting websocket because authorization is overloaded")
+            self.close(code=1013, reason="authorization overloaded")
+            self._auth_task = None
+            return
+        try:
+            if self.auth_slots is not None:
+                await self.auth_slots.acquire()
+                acquired = True
+            ADMISSION_QUEUE.observe_ms(
+                (time.monotonic() - queue_started) * 1000
+            )
+            await self._open_admitted(queue_started)
+        except asyncio.CancelledError:
+            LOG.debug("Websocket closed before authorization completed")
+        finally:
+            if acquired and self.auth_slots is not None:
+                self.auth_slots.release()
+            self._release_auth_admission()
+            self._auth_task = None
+
+    async def _open_admitted(self, admission_started: float) -> None:
         """
         Handle a new client connection and perform authorization.
         """
-        admission_started = time.monotonic()
         self.source_ip = self._client_ip()
         auth = self.get_query_argument("authorization", None)
         try:
@@ -703,15 +1095,21 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         LOG.debug(f"Authorizing client from {self.source_ip or 'unknown'} - {useragent}")
 
         def do_send(payload: str, is_bin: bool):
+            completion = Future()
+
+            def _write() -> None:
+                # IOLoop.add_callback observes an awaitable returned by its
+                # callback.  Returning ``completion`` here would therefore
+                # make a routine close race escape through Tornado as an
+                # unhandled WebSocketClosedError.  The transport Future is
+                # still chained to ``completion`` for callers that retain it.
+                _write_websocket_message(self, payload, is_bin, completion)
+
             if self.event_loop_thread_id == get_ident():
-                _write_websocket_message(self, payload, is_bin)
+                _write()
             else:
-                self.loop.add_callback(
-                    _write_websocket_message,
-                    self,
-                    payload,
-                    is_bin,
-                )
+                self.loop.add_callback(_write)
+            return completion
 
         def do_disconnect():
             self.loop.add_callback(self.close)
@@ -728,7 +1126,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         self.client.source_ip = self.source_ip
         lookup_started = time.monotonic()
         try:
-            user: Optional[Client] = await self._lookup_client_by_api_key(key)
+            user, lookup_timings = await self._lookup_client_by_api_key(key)
         except Exception:
             LOG.exception("Client database lookup failed during websocket authorization")
             self.close(code=1011, reason="client database unavailable")
@@ -856,6 +1254,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                 return
             if not initialized:
                 return
+            self._client_admitted = True
             try:
                 lifecycle = self.connect_lifecycle_executor.submit(
                     publish_lifecycle,
@@ -878,6 +1277,7 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
                     self.hm_protocol.handle_new_client,
                     self.client,
                 )
+                self._client_admitted = True
             except Exception:
                 LOG.exception("Client admission callback failed")
                 self.close(code=1011, reason="client admission unavailable")
@@ -888,6 +1288,8 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             LOG.info(
                 "Slow HiveMind websocket admission: "
                 f"lookup_ms={lookup_ms:.0f} "
+                f"redis_command_ms={lookup_timings.get('redis_command_ms', 0):.0f} "
+                f"redis_deserialize_ms={lookup_timings.get('redis_deserialize_ms', 0):.0f} "
                 f"password_ms={password_ms:.0f} "
                 f"protocol_ms={protocol_ms:.0f} "
                 f"total_ms={total_ms:.0f} "
@@ -896,8 +1298,18 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         # self.write_message(Message("connected").serialize())
 
     def on_close(self):
+        self._cancel_inbound_processing()
+        auth_future = self._auth_lookup_future
+        if auth_future is not None and not auth_future.done():
+            auth_future.cancel()
+        auth_task = self._auth_task
+        if auth_task is not None and not auth_task.done():
+            auth_task.cancel()
+        self._release_auth_admission()
         client = getattr(self, "client", None)
-        if client is None:
+        if (client is None
+                or ("_client_admitted" in self.__dict__
+                    and not self._client_admitted)):
             LOG.debug(
                 f"closing unauthenticated websocket from {self.request.remote_ip} "
                 f"(no client was ever attached)"
