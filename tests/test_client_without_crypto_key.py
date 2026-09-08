@@ -7,8 +7,6 @@ once CI picked up a 5.x hivemind-plugin-manager.
 """
 from types import SimpleNamespace
 
-import pytest
-
 import hivemind_websocket_protocol as websocket_protocol
 from tests.test_protocol_unit import _open_handler, _run_open
 
