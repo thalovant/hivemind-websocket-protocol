@@ -1193,18 +1193,35 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             # in-memory work, so avoid a thread-pool round trip on that PSK
             # fast path. Password-only clients retain executor isolation for
             # strength validation.
-            if self.prefer_preshared_key and self.client.crypto_key:
-                self.client.pswd_handshake = _new_password_handshake(
-                    user.password,
-                    0.0,
+            try:
+                if self.prefer_preshared_key and self.client.crypto_key:
+                    self.client.pswd_handshake = _new_password_handshake(
+                        user.password,
+                        0.0,
+                    )
+                else:
+                    self.client.pswd_handshake = await self.loop.run_in_executor(
+                        self.handshake_executor,
+                        _new_password_handshake,
+                        user.password,
+                        self.password_min_bits,
+                    )
+            except ValueError as error:
+                # check_password_strength raises WeakPasswordError (a
+                # ValueError) when this client's stored credential is below
+                # the configured floor. Left uncaught it escaped open() as an
+                # internal error and the socket was torn down with no reason
+                # -- indistinguishable, from the client, from a crash.
+                # Not handle_invalid_key_connected: that fires on_invalid_key,
+                # which means the CLIENT presented bad credentials. This is
+                # the operator's stored record failing policy, and the client
+                # should not be counted against for it.
+                LOG.warning(
+                    f"rejecting websocket from {self._peer_label(useragent)}: "
+                    f"stored password fails the strength policy ({error})"
                 )
-            else:
-                self.client.pswd_handshake = await self.loop.run_in_executor(
-                    self.handshake_executor,
-                    _new_password_handshake,
-                    user.password,
-                    self.password_min_bits,
-                )
+                self.close(code=1008, reason="password below strength policy")
+                return
         password_ms = (time.monotonic() - password_started) * 1000
 
         self.client.node_type = HiveMindNodeType.NODE  # TODO . placeholder
