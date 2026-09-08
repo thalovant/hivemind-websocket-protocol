@@ -106,37 +106,52 @@ def _private_key_fingerprint(
     path: Optional[str],
 ) -> Optional[tuple[str, int, int, int, int]]:
     """Return a cheap rotation-aware fingerprint for a listener private key."""
-    if not path or not os.path.isfile(path):
+    if not path:
         return None
-    resolved = os.path.realpath(path)
-    stat = os.stat(resolved)
+    try:
+        resolved = os.path.realpath(path)
+        if not os.path.isfile(resolved):
+            return None
+        stat = os.stat(resolved)
+    except OSError:
+        # The file can be replaced or removed between the check and the stat.
+        # A key we cannot fingerprint is simply one we decline to cache.
+        return None
     return resolved, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _isolated_handshake(handshake: HandShake) -> HandShake:
+    """Clear the fields that belong to one connection and must not be shared."""
+    handshake.target_key = None
+    handshake.secret = None
+    return handshake
 
 
 def _new_client_handshake(path: Optional[str]) -> HandShake:
     """Create isolated handshake state without reparsing an unchanged RSA key."""
     fingerprint = _private_key_fingerprint(path)
     if fingerprint is None:
-        return HandShake(path)
+        return _isolated_handshake(HandShake(path))
 
     cache_key = os.path.abspath(path)
     with _HANDSHAKE_TEMPLATE_LOCK:
         cached = _HANDSHAKE_TEMPLATE_CACHE.get(cache_key)
         if cached is None or cached[0] != fingerprint:
             template = HandShake(path)
-            current_fingerprint = _private_key_fingerprint(path)
-            if current_fingerprint is None:
-                return template
-            _HANDSHAKE_TEMPLATE_CACHE[cache_key] = (current_fingerprint, template)
+            # Cache only if the file did not change while it was being parsed.
+            # Filing this template under the POST-parse fingerprint would store
+            # a key read from the old file under the new file's identity, and
+            # every later connection would reuse that stale key until the next
+            # rotation -- long after the rotation was supposed to take effect.
+            if _private_key_fingerprint(path) != fingerprint:
+                return _isolated_handshake(template)
+            _HANDSHAKE_TEMPLATE_CACHE[cache_key] = (fingerprint, template)
         else:
             template = cached[1]
 
         handshake = copy.copy(template)
 
-    # These fields are connection-local and must never leak across copies.
-    handshake.target_key = None
-    handshake.secret = None
-    return handshake
+    return _isolated_handshake(handshake)
 
 
 def _new_password_handshake(
