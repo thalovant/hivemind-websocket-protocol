@@ -73,4 +73,8 @@ def test_a_strong_password_is_not_affected(handler, monkeypatch):
 
     _run_open(h)
 
-    assert not [c for c in closes if c["kwargs"].get("code") == 1008]
+    # Admitted outright: the client reached handle_new_client and the
+    # connection was not closed for any reason, not merely "not 1008".
+    assert seen == [h.client]
+    assert closes == []
+    assert h.client.pswd_handshake is not None
