@@ -1170,7 +1170,11 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             resolved_user_cache_seeded = True
 
         self.client.name = f"{useragent}::{user.client_id}::{user.name}"
-        self.client.crypto_key = user.crypto_key
+        # HiveMind-core 5.x derives the v3 Noise PSK from the password and
+        # dropped crypto_key from the Client model; a record from that model
+        # simply has no such attribute. Read it optionally, as the HTTP
+        # protocol does, so a 5.x database admits clients at all.
+        self.client.crypto_key = getattr(user, "crypto_key", None)
         self.client.skill_blacklist = user.skill_blacklist or []
         self.client.intent_blacklist = user.intent_blacklist or []
         self.client.allowed_types = user.allowed_types

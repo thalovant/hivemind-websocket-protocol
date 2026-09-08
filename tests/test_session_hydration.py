@@ -8,19 +8,10 @@ from hivemind_websocket_protocol import HiveMindTornadoWebSocket
 
 
 def _montreal_location() -> dict:
-    return {
-        "city": {
-            "code": "Montreal",
-            "name": "Montreal",
-            "state": {
-                "code": "QC",
-                "name": "Quebec",
-                "country": {"code": "CA", "name": "Canada"},
-            },
-        },
-        "coordinate": {"latitude": 45.5, "longitude": -73.6},
-        "timezone": {"code": "America/Toronto", "name": "America/Toronto"},
-    }
+    # OVOS-SESSION-1 §3.5 shape; ovos-bus-client >= 2.11 normalizes the legacy
+    # nested mycroft.conf city/coordinate/timezone shape into this and no
+    # longer emits "city" on serialize.
+    return {"lat": 45.5, "lon": -73.6, "tz": "America/Toronto"}
 
 
 def _handler_with_session(session: Session) -> HiveMindTornadoWebSocket:
@@ -50,8 +41,9 @@ def test_hello_session_is_cached_on_connection() -> None:
     assert session["session_id"] == "sat-session"
     assert session["site_id"] == "office"
     assert session["lang"] == "fr-FR"
-    assert session["location"]["city"]["name"] == "Montreal"
-    assert session["location"]["timezone"]["code"] == "America/Toronto"
+    assert session["location"]["lat"] == 45.5
+    assert session["location"]["lon"] == -73.6
+    assert session["location"]["tz"] == "America/Toronto"
 
 
 def test_bus_session_hydrates_missing_fields_from_cached_connection_session() -> None:
@@ -79,6 +71,7 @@ def test_bus_session_hydrates_missing_fields_from_cached_connection_session() ->
     assert session["session_id"] == "sat-session"
     assert session["site_id"] == "office"
     assert session["lang"] == "fr-FR"
-    assert session["location"]["city"]["name"] == "Montreal"
-    assert session["location"]["timezone"]["code"] == "America/Toronto"
+    assert session["location"]["lat"] == 45.5
+    assert session["location"]["lon"] == -73.6
+    assert session["location"]["tz"] == "America/Toronto"
     assert session["time_format"] == "full"
