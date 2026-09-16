@@ -676,8 +676,6 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             HiveMindTornadoWebSocket.inbound_admission_capacity = None
             HiveMindTornadoWebSocket.inbound_client_queue_size = None
             HiveMindTornadoWebSocket.inbound_pending = 0
-            HiveMindTornadoWebSocket.disconnect_executor = None
-            HiveMindTornadoWebSocket.connect_lifecycle_executor = None
             HiveMindTornadoWebSocket.password_min_bits = None
             HiveMindTornadoWebSocket.slow_admission_log_ms = (
                 DEFAULT_SLOW_ADMISSION_LOG_MS
@@ -691,8 +689,14 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             # the presence its disconnect has to clear, and dropping either
             # leaves a client marked connected on the runtime bus after the
             # server that admitted it is gone. Let them finish.
+            # Cleared only once they have drained: a lifecycle callback
+            # finishing during the drain submits its disconnect through these,
+            # and nulling them first sent it down the embedded-handler path
+            # instead -- or, with the loop already stopped, nowhere at all.
             connect_lifecycle_executor.shutdown(wait=True)
             disconnect_executor.shutdown(wait=True)
+            HiveMindTornadoWebSocket.disconnect_executor = None
+            HiveMindTornadoWebSocket.connect_lifecycle_executor = None
         if startup_error is not None:
             raise startup_error
 
@@ -1390,11 +1394,15 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
         LOG.debug(f"disconnecting client: {self._peer_label(client.peer)}")
         lifecycle = self._connect_lifecycle_future
         if lifecycle is not None and not lifecycle.done():
+            # Submitted straight from the lifecycle future's completion, not
+            # hopped through the IOLoop: at shutdown `loop.start()` returns
+            # before the executors drain, and a callback added after that
+            # simply sits in the queue until some later `loop.start()` that
+            # never comes -- leaving the client marked connected on the runtime
+            # bus. `_submit_disconnect_callback` only touches the executor,
+            # which is safe from the lifecycle thread.
             lifecycle.add_done_callback(
-                lambda _future: self.loop.add_callback(
-                    self._submit_disconnect_callback,
-                    client,
-                )
+                lambda _future: self._submit_disconnect_callback(client)
             )
             return
         self._submit_disconnect_callback(client)

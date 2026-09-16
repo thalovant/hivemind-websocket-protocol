@@ -1824,3 +1824,47 @@ def test_an_uncaught_exception_log_carries_no_query_string():
     joined = "\n".join(records)
     assert "c2VjcmV0OnRva2Vu" not in joined, joined
     assert "authorization=" not in joined, joined
+
+
+def test_a_disconnect_deferred_behind_admission_does_not_need_the_ioloop():
+    """`loop.start()` returns before the executors drain.
+
+    A deferred disconnect hopped through `loop.add_callback` would then sit in
+    a queue until some later `loop.start()` that never comes, leaving the
+    client marked connected on the runtime bus after the server is gone.
+    """
+    from concurrent.futures import Future
+    from unittest.mock import MagicMock
+
+    from hivemind_websocket_protocol import HiveMindTornadoWebSocket
+
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.request = MagicMock()
+    handler.request.remote_ip = "203.0.113.7"
+    handler.hm_protocol = MagicMock()
+    handler._disconnect_submitted = False
+    handler._auth_lookup_future = None
+    handler._auth_task = None
+    handler._cancel_inbound_processing = lambda: None
+    handler._release_auth_admission = lambda: None
+    handler._peer_label = lambda peer: str(peer)
+    handler.client = MagicMock()
+    handler.client.peer = "peer"
+    # No executor: the embedded/test path calls through synchronously.
+    handler.disconnect_executor = None
+    # An IOLoop that has already stopped drops anything added to it.
+    handler.loop = MagicMock()
+    handler.loop.add_callback.side_effect = AssertionError(
+        "the disconnect must not depend on the IOLoop still running"
+    )
+
+    lifecycle: Future = Future()
+    lifecycle.set_running_or_notify_cancel()
+    handler._connect_lifecycle_future = lifecycle
+
+    handler.on_close()
+    handler.hm_protocol.handle_client_disconnected.assert_not_called()
+
+    # Admission finishes after the socket closed -- the disconnect follows it.
+    lifecycle.set_result(None)
+    handler.hm_protocol.handle_client_disconnected.assert_called_once_with(handler.client)
