@@ -24,6 +24,8 @@ from ovos_bus_client.session import Session
 from ovos_utils.log import LOG
 from ovos_utils.xdg_utils import xdg_data_home
 from poorman_handshake import HandShake, PasswordHandShake, check_password_strength
+import traceback
+
 from tornado import ioloop
 from tornado import web
 from tornado.iostream import StreamClosedError
@@ -313,7 +315,10 @@ def _positive_int(value: Any, default: int, name: str) -> int:
         return default
     try:
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError with the others: int(float("inf")) raises it, and a
+        # non-finite worker count reaching this from configuration aborted
+        # startup instead of falling back to the documented default.
         LOG.warning(f"Ignoring invalid {name}: {value!r}")
         return default
     if parsed < 1:
@@ -677,14 +682,17 @@ class HiveMindWebsocketProtocol(NetworkProtocol):
             HiveMindTornadoWebSocket.slow_admission_log_ms = (
                 DEFAULT_SLOW_ADMISSION_LOG_MS
             )
+            # Admission and inbound work is discardable at teardown: whatever
+            # it would have produced, nobody is left to receive.
             auth_executor.shutdown(wait=True, cancel_futures=True)
             handshake_executor.shutdown(wait=True, cancel_futures=True)
             inbound_executor.shutdown(wait=True, cancel_futures=True)
-            connect_lifecycle_executor.shutdown(
-                wait=True,
-                cancel_futures=True,
-            )
-            disconnect_executor.shutdown(wait=True, cancel_futures=True)
+            # The lifecycle pair is not. A connect callback already queued owns
+            # the presence its disconnect has to clear, and dropping either
+            # leaves a client marked connected on the runtime bus after the
+            # server that admitted it is gone. Let them finish.
+            connect_lifecycle_executor.shutdown(wait=True)
+            disconnect_executor.shutdown(wait=True)
         if startup_error is not None:
             raise startup_error
 
@@ -981,6 +989,23 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
 
     def _peer_label(self, peer: str) -> str:
         return f"{peer} ({self.source_ip})" if self.source_ip else peer
+
+    def log_exception(self, typ, value, tb) -> None:
+        """Keep a query string out of the uncaught-exception log too.
+
+        ``_request_summary`` only covers the ordinary request line. Tornado's
+        exception logger prints ``self.request`` directly, and
+        ``HTTPServerRequest.__repr__`` includes the URI -- so a credential
+        passed as a query parameter survived the redaction that the normal path
+        already applied.
+        """
+        if isinstance(value, web.HTTPError):
+            return super().log_exception(typ, value, tb)
+        LOG.error(
+            "Uncaught exception %s\n%s",
+            self._request_summary(),
+            "".join(traceback.format_exception(typ, value, tb)),
+        )
 
     def _request_summary(self) -> str:
         """Keep query-string credentials out of Tornado request logs."""

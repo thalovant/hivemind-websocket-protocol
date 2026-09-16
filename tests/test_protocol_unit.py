@@ -1765,3 +1765,62 @@ def test_run_ssl_path_generates_missing_cert(tmp_path):
     assert not t.is_alive()
     assert (cert_dir / "gen-me.crt").exists()
     assert (cert_dir / "gen-me.key").exists()
+
+
+def test_a_non_finite_worker_count_falls_back_instead_of_aborting_startup():
+    """`int(float("inf"))` raises OverflowError, not ValueError.
+
+    A non-finite worker count reaching this from configuration used to abort
+    startup rather than fall back to the documented default -- the one outcome
+    the fallback exists to prevent.
+    """
+    from hivemind_websocket_protocol import _positive_int
+
+    for value in (float("inf"), float("-inf"), float("nan")):
+        assert _positive_int(value, 7, "workers") == 7, value
+    # The ordinary invalid inputs keep behaving as they did.
+    assert _positive_int("nonsense", 7, "workers") == 7
+    assert _positive_int(0, 7, "workers") == 7
+    assert _positive_int(None, 7, "workers") == 7
+    assert _positive_int(3, 7, "workers") == 3
+
+
+def test_an_uncaught_exception_log_carries_no_query_string():
+    """Tornado prints `self.request`, whose repr includes the URI.
+
+    `_request_summary` only covers the ordinary request line, so a credential
+    passed as a query parameter survived into the exception log that the normal
+    path already redacted.
+    """
+    import logging
+    from unittest.mock import MagicMock
+
+    from hivemind_websocket_protocol import HiveMindTornadoWebSocket
+
+    handler = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    handler.request = MagicMock()
+    handler.request.remote_ip = "203.0.113.7"
+    handler.request.method = "GET"
+    handler.request.uri = "/?authorization=c2VjcmV0OnRva2Vu"
+    handler.request.__repr__ = lambda _self: (
+        "HTTPServerRequest(uri='/?authorization=c2VjcmV0OnRva2Vu')"
+    )
+
+    records = []
+    import hivemind_websocket_protocol as module
+
+    class _Recorder:
+        def error(self, message, *args):
+            records.append(message % args if args else message)
+
+    original = module.LOG
+    module.LOG = _Recorder()
+    try:
+        handler.log_exception(ValueError, ValueError("boom"), None)
+    finally:
+        module.LOG = original
+
+    assert records, "the exception was not logged at all"
+    joined = "\n".join(records)
+    assert "c2VjcmV0OnRva2Vu" not in joined, joined
+    assert "authorization=" not in joined, joined

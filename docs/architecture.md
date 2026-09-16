@@ -59,6 +59,17 @@ to an ordered disconnect executor. Runtime-bus disconnect notifications can
 perform synchronous I/O, so they must not run on Tornado's event-loop thread or
 delay unrelated handshakes.
 
+A disconnect that arrives while admission is still running is deferred until
+the connect lifecycle finishes, so a client can never be published after its
+own cleanup has run. At shutdown, the connect and disconnect executors are
+drained rather than cancelled: dropping either would leave a client marked
+connected on the runtime bus after the server that admitted it is gone.
+
+When no executor is installed -- an embedded or test harness that mounts the
+handler without `HiveMindWebsocketProtocol.run()` -- the callback runs
+synchronously on the caller's thread instead. Transport integrators relying on
+that compatibility path keep the historical behaviour.
+
 ## Authorization
 
 Clients connect with a URL query parameter:
