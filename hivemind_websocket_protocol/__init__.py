@@ -1355,10 +1355,16 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             return
         if "_client_admitted" in self.__dict__ and not self._client_admitted:
             return
+        loop = getattr(type(self), "loop", None)
+        executor = getattr(type(self), "inbound_executor", None)
+        if loop is None or executor is None:
+            return
+        # update_last_seen writes to the database, so it runs off the event loop.
+        # Bookkeeping must never break the connection it describes: a failure is
+        # logged by the executor future and the socket stays up.
         try:
-            protocol.touch_last_seen(client)
+            loop.run_in_executor(executor, protocol.update_last_seen, client)
         except Exception:
-            # Bookkeeping must never break the connection it describes.
             _log.debug("could not record a ping as activity", exc_info=True)
 
     def on_close(self):

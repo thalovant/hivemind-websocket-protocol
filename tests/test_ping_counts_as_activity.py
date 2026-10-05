@@ -9,10 +9,16 @@ from hivemind_websocket_protocol import HiveMindTornadoWebSocket  # noqa: E402
 @pytest.fixture
 def handler(monkeypatch):
     monkeypatch.setattr(tornado_websocket.WebSocketHandler, "on_ping", lambda self, data: None)
-    return HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    loop = mock.Mock()
+    executor = object()
+    monkeypatch.setattr(HiveMindTornadoWebSocket, "loop", loop, raising=False)
+    monkeypatch.setattr(HiveMindTornadoWebSocket, "inbound_executor", executor, raising=False)
+    instance = HiveMindTornadoWebSocket.__new__(HiveMindTornadoWebSocket)
+    instance.loop = loop
+    return instance
 
 
-def test_a_ping_from_an_admitted_client_counts_as_activity(handler):
+def test_a_ping_from_an_admitted_client_records_activity_off_the_loop(handler):
     client = object()
     protocol = mock.Mock()
     handler.client = client
@@ -20,7 +26,10 @@ def test_a_ping_from_an_admitted_client_counts_as_activity(handler):
 
     handler.on_ping(b"")
 
-    protocol.touch_last_seen.assert_called_once_with(client)
+    handler.loop.run_in_executor.assert_called_once()
+    _, func, arg = handler.loop.run_in_executor.call_args.args
+    assert func == protocol.update_last_seen
+    assert arg is client
 
 
 def test_a_ping_before_admission_is_not_activity(handler):
@@ -31,4 +40,4 @@ def test_a_ping_before_admission_is_not_activity(handler):
 
     handler.on_ping(b"")
 
-    protocol.touch_last_seen.assert_not_called()
+    handler.loop.run_in_executor.assert_not_called()
