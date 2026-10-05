@@ -1341,6 +1341,26 @@ class HiveMindTornadoWebSocket(WebSocketHandler):
             )
         # self.write_message(Message("connected").serialize())
 
+    def on_ping(self, data: bytes) -> None:
+        """A keep-alive ping from an admitted client counts as activity.
+
+        Tornado answers the ping itself and only calls this hook. Without it an
+        idle phone sends nothing the hub records, so its last-seen time goes stale
+        and it stops counting as connected, even while the socket is open.
+        """
+        super().on_ping(data)
+        client = getattr(self, "client", None)
+        protocol = getattr(self, "hm_protocol", None)
+        if client is None or protocol is None:
+            return
+        if "_client_admitted" in self.__dict__ and not self._client_admitted:
+            return
+        try:
+            protocol.touch_last_seen(client)
+        except Exception:
+            # Bookkeeping must never break the connection it describes.
+            _log.debug("could not record a ping as activity", exc_info=True)
+
     def on_close(self):
         self._cancel_inbound_processing()
         auth_future = self._auth_lookup_future
