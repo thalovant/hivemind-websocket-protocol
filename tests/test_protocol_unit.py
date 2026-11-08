@@ -50,7 +50,10 @@ from hivemind_websocket_protocol import (
 
 @pytest.fixture(autouse=True)
 def _reset_websocket_sync_state():
-    HiveMindTornadoWebSocket._last_sync_ts = 0.0
+    # Not 0.0: time.monotonic() counts from host boot, and a CI runner can
+    # reach these tests within a 60 s debounce window of it, which made the
+    # first sync of a test look debounced.
+    HiveMindTornadoWebSocket._last_sync_ts = float("-inf")
     HiveMindTornadoWebSocket._last_sync_error = None
     HiveMindTornadoWebSocket.auth_admission_capacity = None
     HiveMindTornadoWebSocket.auth_pending = 0
