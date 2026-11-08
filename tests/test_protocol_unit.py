@@ -50,7 +50,10 @@ from hivemind_websocket_protocol import (
 
 @pytest.fixture(autouse=True)
 def _reset_websocket_sync_state():
-    HiveMindTornadoWebSocket._last_sync_ts = 0.0
+    # Not 0.0: time.monotonic() counts from host boot, and a CI runner can
+    # reach these tests within a 60 s debounce window of it, which made the
+    # first sync of a test look debounced.
+    HiveMindTornadoWebSocket._last_sync_ts = float("-inf")
     HiveMindTornadoWebSocket._last_sync_error = None
     HiveMindTornadoWebSocket.auth_admission_capacity = None
     HiveMindTornadoWebSocket.auth_pending = 0
@@ -955,11 +958,29 @@ def test_open_skips_password_strength_check_when_preshared_key_is_preferred(
     user.password = "strong-machine-secret"
     user.crypto_key = "0123456789abcdef"
     password_handshake = SimpleNamespace(password=user.password)
-    build_handshake = Mock(return_value=password_handshake)
+    # Keep the real helper in the path so a regression that analyses the
+    # password anyway fails here; only the handshake object is stubbed.
+    monkeypatch.setattr(
+        websocket_protocol,
+        "PasswordHandShake",
+        Mock(return_value=password_handshake),
+    )
+    strength_check = Mock()
+    monkeypatch.setattr(
+        websocket_protocol, "check_password_strength", strength_check
+    )
+    real_build = websocket_protocol._new_password_handshake
+    handshake_threads = []
+
+    def build_handshake(*args):
+        handshake_threads.append(threading.get_ident())
+        return real_build(*args)
+
+    build_spy = Mock(side_effect=build_handshake)
     monkeypatch.setattr(
         websocket_protocol,
         "_new_password_handshake",
-        build_handshake,
+        build_spy,
     )
     handler = open_handler(
         SimpleNamespace(get_client_by_api_key=lambda key: user),
@@ -968,17 +989,17 @@ def test_open_skips_password_strength_check_when_preshared_key_is_preferred(
     handler.prefer_preshared_key = True
 
     caller_thread = threading.get_ident()
-    handshake_threads = []
-    build_handshake.side_effect = lambda *_args: (
-        handshake_threads.append(threading.get_ident()) or password_handshake
-    )
 
     _run_open(handler)
 
     assert handler.client.crypto_key == user.crypto_key
     assert handler.client.pswd_handshake is password_handshake
-    build_handshake.assert_called_once_with(user.password, 0.0)
+    build_spy.assert_called_once_with(user.password, 0.0)
     assert handshake_threads == [caller_thread]
+    strength_check.assert_not_called()
+    websocket_protocol.PasswordHandShake.assert_called_once_with(
+        user.password, min_bits=0
+    )
 
 
 def test_open_keeps_password_handshake_without_preshared_key(
