@@ -260,3 +260,14 @@ def test_explicit_empty_config_overrides_env(monkeypatch):
     else:
         value = os.getenv("HIVEMIND_TRUSTED_PROXY_CIDRS")
     assert _split_csv(value) == ()  # explicit empty list wins over env
+
+
+def test_trusted_proxy_on_a_public_address_uses_the_header():
+    """A trusted edge proxy with a global address still yields the client.
+
+    An early version returned any global peer address before checking the
+    trusted networks, so a public proxy never reached the header branch.
+    """
+    trusted = parse_networks(["198.51.100.0/24", "1.1.1.0/24"])
+    headers = {"x-forwarded-for": "8.8.8.8"}
+    assert resolve_client_ip("1.1.1.1", headers, trusted, HEADERS) == "8.8.8.8"
